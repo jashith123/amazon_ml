@@ -26,3 +26,8 @@ work/
 # editors
 .vscode/
 .idea/
+
+# build artefacts
+build/
+work_*.log
+work_*.err
