@@ -15,22 +15,198 @@ from __future__ import annotations
 
 import argparse
 import sys
+import os
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import rapidfuzz
+import rapidfuzz.distance
+import jellyfish
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import paired_cosine_distances
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import schema as S  # noqa: E402
 
 
-def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame) -> pd.DataFrame:
-    """Contract 2 pairs + Contract 1 records -> Contract 3 frame (label kept if present).
+def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.ndarray) -> pd.DataFrame:
+    a = a.fillna("").astype(str)
+    b = b.fillna("").astype(str)
+    
+    # 1. lev_ratio
+    lev = [rapidfuzz.fuzz.ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    # 2. jaro_winkler
+    jw = [rapidfuzz.distance.JaroWinkler.normalized_similarity(x, y) for x, y in zip(a, b)]
+    
+    # 3. char_tfidf_cosine
+    vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,3))
+    vec.fit(fit_corpus)
+    if len(a) > 0:
+        tfidf_a = vec.transform(a)
+        tfidf_b = vec.transform(b)
+        tfidf_cos = (1.0 - paired_cosine_distances(tfidf_a, tfidf_b)).tolist()
+    else:
+        tfidf_cos = []
+    
+    # 4. token_jaccard
+    def tok_jac(x, y):
+        sx, sy = set(x.split()), set(y.split())
+        if not sx and not sy: return 0.0
+        return len(sx & sy) / len(sx | sy)
+    t_jac = [tok_jac(x, y) for x, y in zip(a, b)]
+    
+    # 5. token_overlap
+    def tok_ov(x, y):
+        sx, sy = set(x.split()), set(y.split())
+        if not sx or not sy: return 0.0
+        return len(sx & sy) / min(len(sx), len(sy))
+    t_ov = [tok_ov(x, y) for x, y in zip(a, b)]
+    
+    # 6. token_sort_ratio
+    tsr = [rapidfuzz.fuzz.token_sort_ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    
+    # 7. trigram_jaccard
+    def tri_jac(x, y):
+        sx = set([x[i:i+3] for i in range(len(x)-2)]) if len(x) >= 3 else set([x])
+        sy = set([y[i:i+3] for i in range(len(y)-2)]) if len(y) >= 3 else set([y])
+        sx.discard("")
+        sy.discard("")
+        if not sx and not sy: return 0.0
+        if not sx or not sy: return 0.0
+        return len(sx & sy) / len(sx | sy)
+    tr_jac = [tri_jac(x, y) for x, y in zip(a, b)]
+    
+    # 8. prefix_overlap
+    pref_ov = [len(os.path.commonprefix([x, y])) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 0.0 for x, y in zip(a, b)]
+    
+    # 9. length_diff
+    l_diff = [float(abs(len(x) - len(y))) for x, y in zip(a, b)]
+    
+    # 10. partial_ratio
+    pr = [rapidfuzz.fuzz.partial_ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    
+    # 11. token_set_ratio
+    tset = [rapidfuzz.fuzz.token_set_ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    
+    # 12. length_ratio
+    l_rat = [min(len(x), len(y)) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 1.0 for x, y in zip(a, b)]
+    
+    return pd.DataFrame({
+        f"{prefix}lev_ratio": lev,
+        f"{prefix}jaro_winkler": jw,
+        f"{prefix}char_tfidf_cosine": tfidf_cos,
+        f"{prefix}token_jaccard": t_jac,
+        f"{prefix}token_overlap": t_ov,
+        f"{prefix}token_sort_ratio": tsr,
+        f"{prefix}trigram_jaccard": tr_jac,
+        f"{prefix}prefix_overlap": pref_ov,
+        f"{prefix}length_diff": l_diff,
+        f"{prefix}partial_ratio": pr,
+        f"{prefix}token_set_ratio": tset,
+        f"{prefix}length_ratio": l_rat,
+    }, index=a.index)
 
-    TODO (Person C): implement the six feature groups (rapidfuzz.process.cpdist is the fast
-    element-wise pairwise scorer: process.cpdist(list_a, list_b, scorer=fuzz.ratio, workers=-1)).
-    """
-    raise NotImplementedError("Person C: implement build_features (see docstring)")
+
+def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame) -> pd.DataFrame:
+    """Contract 2 pairs + Contract 1 records -> Contract 3 frame (label kept if present)."""
+    df = pairs.merge(s1.add_prefix("s1_"), left_on="source1_entity_id", right_on="s1_entity_id", how="left")
+    df = df.merge(gallery.add_prefix("cand_"), left_on="candidate_entity_id", right_on="cand_entity_id", how="left")
+    
+    name_corpus = pd.concat([s1["name_norm"], gallery["name_norm"]]).fillna("").unique()
+    addr_corpus = pd.concat([s1["address_norm"], gallery["address_norm"]]).fillna("").unique()
+    
+    name_base = _get_base_metrics(df["s1_name_norm"], df["cand_name_norm"], "name__", name_corpus)
+    addr_base = _get_base_metrics(df["s1_address_norm"], df["cand_address_norm"], "addr__", addr_corpus)
+    
+    a_norm, b_norm = df['s1_name_norm'].fillna(""), df['cand_name_norm'].fillna("")
+    a_core, b_core = df['s1_name_core'].fillna(""), df['cand_name_core'].fillna("")
+    a_suff, b_suff = df['s1_legal_suffix'].fillna(""), df['cand_legal_suffix'].fillna("")
+    
+    exact_norm = (a_norm == b_norm).astype(float)
+    exact_core = (a_core == b_core).astype(float)
+    
+    a_phon = a_core.apply(lambda x: jellyfish.soundex(x) if x else "")
+    b_phon = b_core.apply(lambda x: jellyfish.soundex(x) if x else "")
+    phonetic_match = ((a_phon == b_phon) & (a_phon != "")).astype(float)
+    
+    suff_match = ((a_suff == b_suff) & (a_suff != "")).astype(float)
+    suff_conf = ((a_suff != b_suff) & (a_suff != "") & (b_suff != "")).astype(float)
+    exact_raw = (df['s1_name_raw'].fillna("") == df['cand_name_raw'].fillna("")).astype(float)
+    
+    name_spec = pd.DataFrame({
+        "name__exact_norm_match": exact_norm,
+        "name__exact_core_match": exact_core,
+        "name__phonetic_match": phonetic_match,
+        "name__suffix_match": suff_match,
+        "name__suffix_conflict": suff_conf,
+        "name__exact_raw_match": exact_raw,
+    }, index=df.index)
+    
+    a_hn, b_hn = df['s1_address_numbers'].fillna(""), df['cand_address_numbers'].fillna("")
+    a_pin, b_pin = df['s1_address_pin'].fillna(""), df['cand_address_pin'].fillna("")
+    a_raw, b_raw = df['s1_address_raw'].fillna(""), df['cand_address_raw'].fillna("")
+    
+    hn_exact = ((a_hn == b_hn) & (a_hn != "")).astype(float)
+    hn_conf = ((a_hn != b_hn) & (a_hn != "") & (b_hn != "")).astype(float)
+    pin_exact = ((a_pin == b_pin) & (a_pin != "")).astype(float)
+    both_have = ((a_raw != "") & (b_raw != "")).astype(float)
+    
+    addr_spec = pd.DataFrame({
+        "addr__house_number_exact": hn_exact,
+        "addr__house_number_conflict": hn_conf,
+        "addr__pin_exact": pin_exact,
+        "addr__both_have_address": both_have,
+    }, index=df.index)
+    
+    feats = pd.concat([name_base, name_spec, addr_base, addr_spec], axis=1)
+    
+    name_sim = feats["name__lev_ratio"]
+    addr_sim = feats["addr__lev_ratio"]
+    
+    feats["cross__name_addr_product"] = name_sim * addr_sim
+    feats["cross__name_addr_sum"] = name_sim + addr_sim
+    feats["cross__name_addr_min"] = np.minimum(name_sim, addr_sim)
+    feats["cross__name_addr_max"] = np.maximum(name_sim, addr_sim)
+    feats["cross__name_high_addr_low"] = ((name_sim > 0.8) & (addr_sim < 0.5)).astype(float)
+    feats["cross__name_low_addr_high"] = ((name_sim < 0.5) & (addr_sim > 0.8)).astype(float)
+    feats["cross__name_addr_diff"] = np.abs(name_sim - addr_sim)
+    feats["cross__name_addr_harmonic"] = (2 * name_sim * addr_sim) / (name_sim + addr_sim + 1e-6)
+    
+    feats["cross__country_exact_match"] = (df['country'] == df['cand_country']).astype(float)
+    
+    def extract_nums(s): return set(re.findall(r'\d+', str(s)))
+    s1_nums = (df['s1_name_raw'].fillna("") + " " + df['s1_address_raw'].fillna("")).apply(extract_nums)
+    s2_nums = (df['cand_name_raw'].fillna("") + " " + df['cand_address_raw'].fillna("")).apply(extract_nums)
+    feats["cross__numeric_conflict"] = [float(bool(n1 and n2 and not (n1 & n2))) for n1, n2 in zip(s1_nums, s2_nums)]
+    
+    for c in S.BLOCK_FLAG_COLS:
+        feats[f"block__{c}"] = df[c].fillna(0).astype(float)
+    feats["block__num_legs_retrieved"] = df["num_legs_retrieved"].astype(float)
+    
+    grp = df.groupby("source1_entity_id")["blocking_score"]
+    feats["comp__rank"] = grp.rank(ascending=False, method="first")
+    feats["comp__score_percentile"] = grp.rank(pct=True)
+    feats["comp__score_gap_top1"] = grp.transform("max") - df["blocking_score"]
+    
+    feats["sem__embedding_cosine"] = 0.0
+    feats["sem__embedding_rank"] = 0.0
+    feats["sem__embedding_percentile"] = 0.0
+    feats["sem__embedding_gap"] = 0.0
+    
+    feats["source1_entity_id"] = df["source1_entity_id"]
+    feats["candidate_entity_id"] = df["candidate_entity_id"]
+    feats["candidate_source"] = df["candidate_source"]
+    feats["country"] = df["country"]
+    if S.LABEL_COL in df.columns:
+        feats[S.LABEL_COL] = df[S.LABEL_COL]
+        
+    for c in feats.columns:
+        if c.startswith(S.FEATURE_PREFIXES):
+            feats[c] = feats[c].fillna(0.0)
+            
+    return feats
 
 
 def write_splits(feats: pd.DataFrame, splits_dir: Path = S.SPLITS_DIR, val_frac: float = 0.2) -> None:
