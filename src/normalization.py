@@ -3,19 +3,18 @@ import pandas as pd
 import numpy as np
 import re
 import unicodedata
-from indic_transliteration import sanscript
-from indic_transliteration.detect import detect
+from anyascii import anyascii
 
 import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.common.schema import NORMALIZED_COLUMNS
+from src.common.schema import NORMALIZED_COLS
 
 LEGAL_SUFFIXES = [
     'pvt ltd', 'private limited', 'pvt limited', 'private ltd',
     'ltd', 'limited', 'corp', 'corporation', 'inc', 'incorporated',
-    'llc', 'gmbh', 'sarl', 'co', 'company', 'plc'
+    'llc', 'gmbh', 'sarl', 'sas', 'sci', 'eurl', 'co', 'company', 'plc'
 ]
 
 LEGAL_SUFFIXES_SORTED = sorted(LEGAL_SUFFIXES, key=len, reverse=True)
@@ -61,20 +60,6 @@ def get_tokens(text):
     tokens = set(text.split())
     return '|'.join(sorted(list(tokens)))
 
-def transliterate_and_fold(text):
-    if not text: return ''
-    
-    if is_non_latin(text):
-        scheme = detect(text)
-        if scheme:
-            # Prevent detecting ascii as ITRANS if it somehow still happens, though is_non_latin prevents this
-            text = sanscript.transliterate(text, scheme, sanscript.ITRANS).lower()
-            
-    for k, v in FRENCH_LIGATURES.items():
-        text = text.replace(k, v)
-        
-    return text
-
 def extract_numbers(text):
     if not text: return ''
     tokens = text.split()
@@ -103,9 +88,13 @@ def normalize_source(df: pd.DataFrame) -> pd.DataFrame:
     out['name_raw'] = df['business_name'].fillna('').astype(str)
     out['address_raw'] = df['business_address'].fillna('').astype(str)
     
+    out['is_non_latin'] = out['name_raw'].apply(is_non_latin)
+    
     def norm_text(t):
         if not t: return ''
-        t = unicodedata.normalize('NFKD', t)
+        # Transliterate Indic text and drop accents BEFORE stripping punctuation
+        if not t.isascii():
+            t = anyascii(t)
         t = t.lower()
         t = remove_punctuation(t)
         t = collapse_whitespace(t)
@@ -124,12 +113,26 @@ def normalize_source(df: pd.DataFrame) -> pd.DataFrame:
     out['legal_suffix'] = suffixes
     out['name_tokens'] = out['name_core'].apply(get_tokens)
     
-    out['is_non_latin'] = out['name_raw'].apply(is_non_latin)
-    out['name_transliterated'] = out['name_norm'].apply(transliterate_and_fold)
+    # name_transliterated logic now redundant as name_norm does anyascii, 
+    # but to follow contract we can just copy name_norm or apply French fold on raw
+    def transliterate_and_fold(raw, norm, non_latin):
+        if not raw: return ''
+        # If it was non_latin, norm already transliterated it via anyascii
+        # But let's apply French ligatures fold explicitly on the transliterated result or raw
+        t = anyascii(raw).lower() if non_latin else raw.lower()
+        for k, v in FRENCH_LIGATURES.items():
+            t = t.replace(k, v)
+        t = remove_punctuation(t)
+        t = collapse_whitespace(t)
+        return t
+        
+    out['name_transliterated'] = out.apply(lambda row: transliterate_and_fold(row['name_raw'], row['name_norm'], row['is_non_latin']), axis=1)
     
     def norm_addr(t):
         if not t: return ''
-        t = unicodedata.normalize('NFKD', t).lower()
+        if not t.isascii():
+            t = anyascii(t)
+        t = t.lower()
         t = remove_punctuation(t)
         t = collapse_whitespace(t)
         for patt, repl in ABBREVIATIONS.items():
@@ -140,7 +143,7 @@ def normalize_source(df: pd.DataFrame) -> pd.DataFrame:
     out['address_numbers'] = out['address_norm'].apply(extract_numbers)
     out['address_pin'] = out['address_norm'].apply(extract_pin)
     
-    out = out[NORMALIZED_COLUMNS]
+    out = out[NORMALIZED_COLS]
     return out
 
 if __name__ == '__main__':
