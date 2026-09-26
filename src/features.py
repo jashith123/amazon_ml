@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import rapidfuzz
 import rapidfuzz.distance
+import rapidfuzz.process
 import jellyfish
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import paired_cosine_distances
@@ -31,21 +32,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import schema as S  # noqa: E402
 
 
-def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.ndarray) -> pd.DataFrame:
-    a = a.fillna("").astype(str)
-    b = b.fillna("").astype(str)
+def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, vec: TfidfVectorizer) -> pd.DataFrame:
+    a_list = a.fillna("").astype(str).tolist()
+    b_list = b.fillna("").astype(str).tolist()
     
-    # 1. lev_ratio
-    lev = [rapidfuzz.fuzz.ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    # 2. jaro_winkler
-    jw = [rapidfuzz.distance.JaroWinkler.normalized_similarity(x, y) for x, y in zip(a, b)]
+    # Fast metrics with cpdist
+    lev = rapidfuzz.process.cpdist(a_list, b_list, scorer=rapidfuzz.fuzz.ratio, workers=-1) / 100.0
+    jw = rapidfuzz.process.cpdist(a_list, b_list, scorer=rapidfuzz.distance.JaroWinkler.normalized_similarity, workers=-1)
+    tsr = rapidfuzz.process.cpdist(a_list, b_list, scorer=rapidfuzz.fuzz.token_sort_ratio, workers=-1) / 100.0
+    pr = rapidfuzz.process.cpdist(a_list, b_list, scorer=rapidfuzz.fuzz.partial_ratio, workers=-1) / 100.0
+    tset = rapidfuzz.process.cpdist(a_list, b_list, scorer=rapidfuzz.fuzz.token_set_ratio, workers=-1) / 100.0
     
     # 3. char_tfidf_cosine
-    vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,3))
-    vec.fit(fit_corpus)
-    if len(a) > 0:
-        tfidf_a = vec.transform(a)
-        tfidf_b = vec.transform(b)
+    if len(a_list) > 0:
+        tfidf_a = vec.transform(a_list)
+        tfidf_b = vec.transform(b_list)
         tfidf_cos = (1.0 - paired_cosine_distances(tfidf_a, tfidf_b)).tolist()
     else:
         tfidf_cos = []
@@ -55,17 +56,14 @@ def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.nd
         sx, sy = set(x.split()), set(y.split())
         if not sx and not sy: return 0.0
         return len(sx & sy) / len(sx | sy)
-    t_jac = [tok_jac(x, y) for x, y in zip(a, b)]
+    t_jac = [tok_jac(x, y) for x, y in zip(a_list, b_list)]
     
     # 5. token_overlap
     def tok_ov(x, y):
         sx, sy = set(x.split()), set(y.split())
         if not sx or not sy: return 0.0
         return len(sx & sy) / min(len(sx), len(sy))
-    t_ov = [tok_ov(x, y) for x, y in zip(a, b)]
-    
-    # 6. token_sort_ratio
-    tsr = [rapidfuzz.fuzz.token_sort_ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    t_ov = [tok_ov(x, y) for x, y in zip(a_list, b_list)]
     
     # 7. trigram_jaccard
     def tri_jac(x, y):
@@ -76,22 +74,16 @@ def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.nd
         if not sx and not sy: return 0.0
         if not sx or not sy: return 0.0
         return len(sx & sy) / len(sx | sy)
-    tr_jac = [tri_jac(x, y) for x, y in zip(a, b)]
+    tr_jac = [tri_jac(x, y) for x, y in zip(a_list, b_list)]
     
     # 8. prefix_overlap
-    pref_ov = [len(os.path.commonprefix([x, y])) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 0.0 for x, y in zip(a, b)]
+    pref_ov = [len(os.path.commonprefix([x, y])) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 0.0 for x, y in zip(a_list, b_list)]
     
     # 9. length_diff
-    l_diff = [float(abs(len(x) - len(y))) for x, y in zip(a, b)]
-    
-    # 10. partial_ratio
-    pr = [rapidfuzz.fuzz.partial_ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    
-    # 11. token_set_ratio
-    tset = [rapidfuzz.fuzz.token_set_ratio(x, y) / 100.0 for x, y in zip(a, b)]
+    l_diff = [float(abs(len(x) - len(y))) for x, y in zip(a_list, b_list)]
     
     # 12. length_ratio
-    l_rat = [min(len(x), len(y)) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 1.0 for x, y in zip(a, b)]
+    l_rat = [min(len(x), len(y)) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 1.0 for x, y in zip(a_list, b_list)]
     
     return pd.DataFrame({
         f"{prefix}lev_ratio": lev,
@@ -109,16 +101,13 @@ def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.nd
     }, index=a.index)
 
 
-def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame) -> pd.DataFrame:
+def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame, name_vec: TfidfVectorizer, addr_vec: TfidfVectorizer) -> pd.DataFrame:
     """Contract 2 pairs + Contract 1 records -> Contract 3 frame (label kept if present)."""
     df = pairs.merge(s1.add_prefix("s1_"), left_on="source1_entity_id", right_on="s1_entity_id", how="left")
     df = df.merge(gallery.add_prefix("cand_"), left_on="candidate_entity_id", right_on="cand_entity_id", how="left")
     
-    name_corpus = pd.concat([s1["name_norm"], gallery["name_norm"]]).fillna("").unique()
-    addr_corpus = pd.concat([s1["address_norm"], gallery["address_norm"]]).fillna("").unique()
-    
-    name_base = _get_base_metrics(df["s1_name_norm"], df["cand_name_norm"], "name__", name_corpus)
-    addr_base = _get_base_metrics(df["s1_address_norm"], df["cand_address_norm"], "addr__", addr_corpus)
+    name_base = _get_base_metrics(df["s1_name_norm"], df["cand_name_norm"], "name__", name_vec)
+    addr_base = _get_base_metrics(df["s1_address_norm"], df["cand_address_norm"], "addr__", addr_vec)
     
     a_norm, b_norm = df['s1_name_norm'].fillna(""), df['cand_name_norm'].fillna("")
     a_core, b_core = df['s1_name_core'].fillna(""), df['cand_name_core'].fillna("")
@@ -144,12 +133,13 @@ def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame)
         "name__exact_raw_match": exact_raw,
     }, index=df.index)
     
-    a_hn, b_hn = df['s1_address_numbers'].fillna(""), df['cand_address_numbers'].fillna("")
+    a_hn_first = df['s1_address_numbers'].fillna("").str.split("|").str[0]
+    b_hn_first = df['cand_address_numbers'].fillna("").str.split("|").str[0]
     a_pin, b_pin = df['s1_address_pin'].fillna(""), df['cand_address_pin'].fillna("")
     a_raw, b_raw = df['s1_address_raw'].fillna(""), df['cand_address_raw'].fillna("")
     
-    hn_exact = ((a_hn == b_hn) & (a_hn != "")).astype(float)
-    hn_conf = ((a_hn != b_hn) & (a_hn != "") & (b_hn != "")).astype(float)
+    hn_exact = ((a_hn_first == b_hn_first) & (a_hn_first != "")).astype(float)
+    hn_conf = ((a_hn_first != b_hn_first) & (a_hn_first != "") & (b_hn_first != "")).astype(float)
     pin_exact = ((a_pin == b_pin) & (a_pin != "")).astype(float)
     both_have = ((a_raw != "") & (b_raw != "")).astype(float)
     
@@ -245,13 +235,39 @@ def main(argv=None):
     args = ap.parse_args(argv)
     suffix = "" if args.split == "train" else "_test"
     nd = Path(args.normalized_dir)
+    
     s1 = pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=1, suffix=suffix))
     gal = pd.concat([pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=n, suffix=suffix)) for n in (2, 3)], ignore_index=True)
     pairs = pd.read_parquet(S.CANDIDATES_TRAIN if args.split == "train" else S.CANDIDATES_TEST)
+    
     if args.split == "train":
         pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
         pairs[S.LABEL_COL] = pairs[S.LABEL_COL].astype(int)
-    feats = build_features(pairs, s1, gal)
+        
+    print("Fitting TF-IDF vectorizers...")
+    name_corpus = pd.concat([s1["name_norm"], gal["name_norm"]]).dropna().unique()
+    if len(name_corpus) > 200_000:
+        name_corpus = np.random.RandomState(S.RANDOM_SEED).choice(name_corpus, 200_000, replace=False)
+    name_vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,3)).fit(name_corpus)
+    
+    addr_corpus = pd.concat([s1["address_norm"], gal["address_norm"]]).dropna().unique()
+    if len(addr_corpus) > 200_000:
+        addr_corpus = np.random.RandomState(S.RANDOM_SEED).choice(addr_corpus, 200_000, replace=False)
+    addr_vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,3)).fit(addr_corpus)
+
+    print("Building features in chunks...")
+    s1_ids = pairs["source1_entity_id"].unique()
+    chunk_size = 100_000
+    feats_chunks = []
+    
+    for i in range(0, len(s1_ids), chunk_size):
+        chunk_s1 = set(s1_ids[i:i+chunk_size])
+        chunk_pairs = pairs[pairs["source1_entity_id"].isin(chunk_s1)]
+        fc = build_features(chunk_pairs, s1, gal, name_vec, addr_vec)
+        feats_chunks.append(fc)
+        
+    feats = pd.concat(feats_chunks, ignore_index=True)
+    
     validate_contract3(feats, train=args.split == "train")
     path = S.FEATURES_TRAIN if args.split == "train" else S.FEATURES_TEST
     path.parent.mkdir(parents=True, exist_ok=True)
