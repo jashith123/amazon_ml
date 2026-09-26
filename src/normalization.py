@@ -18,7 +18,7 @@ LEGAL_SUFFIXES = [
 ]
 
 LEGAL_SUFFIXES_SORTED = sorted(LEGAL_SUFFIXES, key=len, reverse=True)
-LEGAL_SUFFIX_REGEX = re.compile(r'\b(' + '|'.join(LEGAL_SUFFIXES_SORTED) + r')\b$')
+LEGAL_SUFFIX_REGEX = re.compile(r'\b(' + '|'.join(LEGAL_SUFFIXES_SORTED) + r')\b')
 
 ABBREVIATIONS = {
     r'\brd\b': 'road',
@@ -48,12 +48,17 @@ def collapse_whitespace(text):
 def extract_legal_suffix(name):
     if not name:
         return name, ''
-    match = LEGAL_SUFFIX_REGEX.search(name)
-    if match:
-        suffix = match.group(1)
-        core = name[:match.start()].strip()
-        return core, suffix
-    return name, ''
+    matches = LEGAL_SUFFIX_REGEX.findall(name)
+    if not matches:
+        return name, ''
+    
+    core = LEGAL_SUFFIX_REGEX.sub(' ', name)
+    core = collapse_whitespace(core)
+    if not core:
+        core = name
+        
+    suffix = " ".join(sorted(set(matches)))
+    return core, suffix
 
 def get_tokens(text):
     if not text: return ''
@@ -152,6 +157,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', required=True, help='Output Parquet file')
     args = parser.parse_args()
     
-    df = pd.read_csv(args.input, sep='\t', dtype=str)
+    df = pd.read_csv(args.input, sep='\t', dtype=str, keep_default_na=False)
     df_norm = normalize_source(df)
     df_norm.to_parquet(args.output, index=False)
