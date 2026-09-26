@@ -201,12 +201,96 @@ def _query_key_tables(q: pd.DataFrame, gal_key_table: pd.DataFrame, top_k_per_qu
 # A fractional cap alone makes the retrieval cost grow quadratically with the gallery
 # (each query touches a fixed *fraction* of the index); an absolute cap bounds it.
 MAX_DF_ABS = int(os.environ.get("BLOCK_MAX_DF_ABS", "10000"))
+# Phonetic leg (word TF-IDF over Metaphone codes of name tokens); 0 disables the leg.
+PHONETIC_TOPN = int(os.environ.get("BLOCK_PHONETIC_TOPN", "0"))
+PHONETIC_THR = float(os.environ.get("BLOCK_PHONETIC_THR", "0.5"))
+PHONETIC_WEIGHT = float(os.environ.get("BLOCK_PHONETIC_WEIGHT", "0.0"))
+
+
+def _phonetic_docs(name_core: pd.Series) -> pd.Series:
+    """Metaphone code per token, space-joined; codes computed once per unique token."""
+    s = name_core.fillna("").astype(str)
+    uniq = pd.unique(pd.Series(" ".join(s.tolist()).split()))
+    code = {}
+    for t in uniq:
+        if t.isdigit():
+            code[t] = t
+        else:
+            try:
+                code[t] = jellyfish.metaphone(t) or t
+            except Exception:  # noqa: BLE001
+                code[t] = t
+    return s.map(lambda x: " ".join(code.get(t, t) for t in x.split()) if x else "")
 
 
 def _max_df(n_gal: int, frac: float):
     if n_gal <= 1000:
         return 1.0
     return max(2, min(int(frac * n_gal), MAX_DF_ABS))
+
+
+# Learned pruner (stage 5 of the plan): a LightGBM ranker over cheap pair features re-orders the
+# union (top UNION_K by heuristic) into the final top-K. Active when the model file exists.
+UNION_K = int(os.environ.get("BLOCK_UNION_K", "80"))
+RETURN_PRUNER_FEATURES = os.environ.get("BLOCK_RETURN_PRUNER_FEATURES") == "1"
+PRUNER_PATH = Path(os.environ.get("BLOCK_PRUNER", str(S.MODELS_DIR / "pruner.txt")))
+PRUNER_FEATURES = ["word_cos", "char_cos", "n_key_legs", "f_exact", "f_addr", "f_pin", "f_bidir", "f_word", "f_char",
+                   "name_tsr", "addr_tsr", "name_ratio", "house_eq", "house_conflict", "name_ntok_s1", "name_ntok_g",
+                   "addr_ntok_g", "g_best_ratio", "g_rank"]
+_PRUNER = None
+_PRUNER_CHECKED = False
+
+
+def _get_pruner():
+    global _PRUNER, _PRUNER_CHECKED
+    if not _PRUNER_CHECKED:
+        _PRUNER_CHECKED = True
+        if os.environ.get("BLOCK_NO_PRUNER") != "1" and PRUNER_PATH.exists():
+            import lightgbm as lgb
+            _PRUNER = lgb.Booster(model_file=str(PRUNER_PATH))
+            print(f"    pruner loaded from {PRUNER_PATH}", flush=True)
+    return _PRUNER
+
+
+def _pair_cheap_features(P, s1_chunk, s1_u, g_u, legs_u, word_cos, char_cos):
+    """Cheap features for union pairs (arrays aligned with s1_u/g_u)."""
+    from rapidfuzz import fuzz
+    from rapidfuzz.process import cpdist
+    q_name = s1_chunk["name_norm"].fillna("").astype(str).to_numpy(dtype=object)
+    q_addr = s1_chunk["address_norm"].fillna("").astype(str).to_numpy(dtype=object)
+    q_first = s1_chunk["address_numbers"].fillna("").astype(str).str.split("|").str[0].fillna("").to_numpy(dtype=object)
+    a_name = q_name[s1_u].tolist(); b_name = P.gal_name[g_u].tolist()
+    a_addr = q_addr[s1_u].tolist(); b_addr = P.gal_addr[g_u].tolist()
+    f = {}
+    f["word_cos"] = word_cos.astype(np.float32)
+    f["char_cos"] = char_cos.astype(np.float32)
+    n_key = np.zeros(len(legs_u), dtype=np.float32)
+    for bit in (LEG_EXACT_KEY, LEG_ADDRESS, LEG_PIN):
+        n_key += (legs_u & bit) > 0
+    f["n_key_legs"] = n_key
+    f["f_exact"] = ((legs_u & LEG_EXACT_KEY) > 0).astype(np.float32)
+    f["f_addr"] = ((legs_u & LEG_ADDRESS) > 0).astype(np.float32)
+    f["f_pin"] = ((legs_u & LEG_PIN) > 0).astype(np.float32)
+    f["f_bidir"] = ((legs_u & LEG_BIDIR) > 0).astype(np.float32)
+    f["f_word"] = ((legs_u & LEG_NAME_TFIDF) > 0).astype(np.float32)
+    f["f_char"] = ((legs_u & LEG_CHAR_NGRAM) > 0).astype(np.float32)
+    f["name_tsr"] = cpdist(a_name, b_name, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100.0
+    f["addr_tsr"] = cpdist(a_addr, b_addr, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100.0
+    f["name_ratio"] = cpdist(a_name, b_name, scorer=fuzz.ratio, workers=-1, dtype=np.float32) / 100.0
+    ha = q_first[s1_u]; hb = P.gal_first[g_u]
+    f["house_eq"] = ((ha == hb) & (ha != "")).astype(np.float32)
+    f["house_conflict"] = ((ha != hb) & (ha != "") & (hb != "")).astype(np.float32)
+    q_ntok = s1_chunk["name_norm"].fillna("").astype(str).str.count(" ").to_numpy(np.float32) + 1
+    f["name_ntok_s1"] = q_ntok[s1_u]
+    f["name_ntok_g"] = P.gal_name_ntok[g_u]
+    f["addr_ntok_g"] = P.gal_addr_ntok[g_u]
+    # chunk-local gallery-side competition: this pair's heuristic vs the best S1 for the same candidate
+    heur = word_cos + char_cos + 0.25 * np.minimum(n_key, 3)
+    df = pd.DataFrame({"g": g_u, "h": heur})
+    gmax = df.groupby("g")["h"].transform("max").to_numpy(np.float32)
+    f["g_best_ratio"] = np.where(gmax > 0, heur / np.maximum(gmax, 1e-6), 1.0).astype(np.float32)
+    f["g_rank"] = df.groupby("g")["h"].rank(ascending=False, method="min").to_numpy(np.float32)
+    return f
 
 
 class _PartitionIndex:
@@ -226,19 +310,35 @@ class _PartitionIndex:
                                         min_df=2 if n_gal > 100 else 1, max_df=_max_df(n_gal, 0.01), dtype=np.float32)
         self.G_char = self.char_vec.fit_transform(gal_char_doc).tocsr()
         self.G_char_T = self.G_char.T.tocsr()
+        # Leg F (phonetic): word TF-IDF over the Metaphone code of every name token. Catches
+        # transliteration spellings ("sauth phuds praivet" ~ "south foods private") that no
+        # character n-gram or exact key survives.
+        self.phon_vec = None
+        if PHONETIC_TOPN > 0:
+            self.phon_vec = TfidfVectorizer(token_pattern=r"\S+", lowercase=False, sublinear_tf=True, min_df=1,
+                                            max_df=_max_df(n_gal, 0.02), dtype=np.float32)
+            self.G_phon = self.phon_vec.fit_transform(_phonetic_docs(gal_part["name_core"])).tocsr()
+            self.G_phon_T = self.G_phon.T.tocsr()
+            self.phon_vec.stop_words_ = None
         # sklearn keeps every pruned term (min_df/max_df) in stop_words_: millions of strings here
         self.word_vec.stop_words_ = None
         self.char_vec.stop_words_ = None
         # Legs D, E, F: key tables
         self.key_tables = _build_key_tables(gal_part, bucket_cap=200, top_k_bucket=30)
         self.gal_ids = gal_part["entity_id"].to_numpy()
+        self.gal_name = gal_part["name_norm"].fillna("").astype(str).to_numpy(dtype=object)
+        self.gal_addr = gal_part["address_norm"].fillna("").astype(str).to_numpy(dtype=object)
+        self.gal_first = gal_part["address_numbers"].fillna("").astype(str).str.split("|").str[0].fillna("").to_numpy(dtype=object)
+        self.gal_name_ntok = gal_part["name_norm"].fillna("").astype(str).str.count(" ").to_numpy(np.float32) + 1
+        self.gal_addr_ntok = gal_part["address_norm"].fillna("").astype(str).str.count(" ").to_numpy(np.float32) + 1
         self.n_gal = n_gal
         self.threads = threads
 
     def transform(self, s1_part: pd.DataFrame):
         word_doc = (s1_part["name_norm"].fillna("").astype(str) + " " + s1_part["address_norm"].fillna("").astype(str)).str.strip()
         char_doc = s1_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
-        return self.word_vec.transform(word_doc).tocsr(), self.char_vec.transform(char_doc).tocsr()
+        Q_phon = self.phon_vec.transform(_phonetic_docs(s1_part["name_core"])).tocsr() if self.phon_vec is not None else None
+        return self.word_vec.transform(word_doc).tocsr(), self.char_vec.transform(char_doc).tocsr(), Q_phon
 
     def bidirectional(self, Q_word_all):
         """Leg C over the whole partition: gallery records as queries against the S1 index."""
@@ -248,7 +348,7 @@ class _PartitionIndex:
 
 
 def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word, Q_char,
-                 bidir_s1: np.ndarray, bidir_g: np.ndarray, country: str) -> pd.DataFrame:
+                 bidir_s1: np.ndarray, bidir_g: np.ndarray, country: str, Q_phon=None) -> pd.DataFrame:
     """All legs for one chunk of S1 rows (partition-local indices offset..offset+len)."""
     n_gal = P.n_gal
     nq = len(s1_chunk)
@@ -261,6 +361,12 @@ def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word
     C_char = sp_matmul_topn(Q_char, P.G_char_T, top_n=40, threshold=0.30, sort=True, n_threads=P.threads).tocoo()
     parts_s1.append(C_char.row.astype(np.int64)); parts_g.append(C_char.col.astype(np.int64))
     parts_legs.append(np.full(len(C_char.row), LEG_CHAR_NGRAM, dtype=np.int32))
+
+    if Q_phon is not None and PHONETIC_TOPN > 0:
+        C_phon = sp_matmul_topn(Q_phon, P.G_phon_T, top_n=PHONETIC_TOPN, threshold=PHONETIC_THR, sort=True,
+                                n_threads=P.threads).tocoo()
+        parts_s1.append(C_phon.row.astype(np.int64)); parts_g.append(C_phon.col.astype(np.int64))
+        parts_legs.append(np.full(len(C_phon.row), LEG_PHONETIC, dtype=np.int32))
 
     lo, hi = np.searchsorted(bidir_s1, offset), np.searchsorted(bidir_s1, offset + nq)
     if hi > lo:
@@ -285,26 +391,44 @@ def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word
 
     word_cos = rowwise_dot(Q_word, P.G_word, s1_u, g_u)
     char_cos = rowwise_dot(Q_char, P.G_char, s1_u, g_u)
+    phon_cos = rowwise_dot(Q_phon, P.G_phon, s1_u, g_u) if Q_phon is not None else np.zeros(len(s1_u), np.float32)
 
-    # Ranking score for EVERY pair from the two real cosines plus a small bonus per key leg and
+    # Ranking score for EVERY pair from the real cosines plus a small bonus per key leg and
     # for a bidirectional hit. (A fixed 0.5 placeholder for key-only hits cost 8 points of recall.)
     n_key_legs = np.zeros(len(legs_u), dtype=np.float32)
-    for bit in (LEG_EXACT_KEY, LEG_ADDRESS, LEG_PIN, LEG_PHONETIC):
+    for bit in (LEG_EXACT_KEY, LEG_ADDRESS, LEG_PIN):
         n_key_legs += (legs_u & bit) > 0
-    blocking_score = (word_cos + char_cos + 0.25 * np.minimum(n_key_legs, 3)
+    blocking_score = (word_cos + char_cos + PHONETIC_WEIGHT * phon_cos + 0.25 * np.minimum(n_key_legs, 3)
                       + 0.15 * ((legs_u & LEG_BIDIR) > 0)).astype(np.float64)
 
-    # Top-K cut per S1 BEFORE materialising string ids (keeps memory flat at full scale)
-    order = np.lexsort((-blocking_score, s1_u))
-    s1_u, g_u, legs_u, blocking_score = s1_u[order], g_u[order], legs_u[order], blocking_score[order]
-    first = np.r_[0, np.flatnonzero(np.diff(s1_u)) + 1]
-    sizes = np.diff(np.r_[first, len(s1_u)])
-    rank = np.arange(len(s1_u)) - np.repeat(first, sizes)
-    keep = rank < S.MAX_CANDIDATES_PER_S1
+    def _topk(score, k):
+        order = np.lexsort((-score, s1_u))
+        first = np.r_[0, np.flatnonzero(np.diff(s1_u[order])) + 1]
+        sizes = np.diff(np.r_[first, len(order)])
+        rank = np.arange(len(order)) - np.repeat(first, sizes)
+        return order[rank < k]
+
+    pruner = _get_pruner()
+    want_feats = pruner is not None or RETURN_PRUNER_FEATURES
+    feats = None
+    if want_feats:
+        # union top UNION_K by heuristic, then cheap features on those pairs only
+        keep = _topk(blocking_score, max(UNION_K, S.MAX_CANDIDATES_PER_S1))
+        s1_u, g_u, legs_u, blocking_score = s1_u[keep], g_u[keep], legs_u[keep], blocking_score[keep]
+        word_cos, char_cos = word_cos[keep], char_cos[keep]
+        feats = _pair_cheap_features(P, s1_chunk, s1_u, g_u, legs_u, word_cos, char_cos)
+        if pruner is not None:
+            X = np.column_stack([feats[c] for c in PRUNER_FEATURES]).astype(np.float32)
+            blocking_score = pruner.predict(X).astype(np.float64)
+    # Final top-K cut per S1 BEFORE materialising string ids (keeps memory flat at full scale)
+    keep = _topk(blocking_score, S.MAX_CANDIDATES_PER_S1)
     s1_u, g_u, legs_u, blocking_score = s1_u[keep], g_u[keep], legs_u[keep], blocking_score[keep]
+    if feats is not None:
+        feats = {c: v[keep] for c, v in feats.items()}
 
     s1_ids = s1_chunk["entity_id"].to_numpy()[s1_u]
     cand_ids = P.gal_ids[g_u]
+    extra = {f"pf_{c}": v for c, v in feats.items()} if (feats is not None and RETURN_PRUNER_FEATURES) else {}
     return pd.DataFrame({
         "source1_entity_id": s1_ids,
         "candidate_entity_id": cand_ids,
@@ -320,6 +444,7 @@ def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word
         "bidirectional_block_hit": (legs_u & LEG_BIDIR) > 0,
         "num_legs_retrieved": np.unpackbits(legs_u.astype(np.uint8)[:, None], axis=1).sum(axis=1).astype(np.int64),
         "blocking_score": blocking_score,
+        **extra,
     })
 
 
@@ -339,13 +464,14 @@ def generate_candidates_for_partition(
     if n_s1 == 0 or len(gal_part) == 0:
         return pd.DataFrame()
     P = _PartitionIndex(gal_part, threads)
-    Q_word_all, Q_char_all = P.transform(s1_part)
+    Q_word_all, Q_char_all, Q_phon_all = P.transform(s1_part)
     bidir_s1, bidir_g = P.bidirectional(Q_word_all)
     parts = []
     for offset in range(0, n_s1, chunk_size):
         chunk = s1_part.iloc[offset:offset + chunk_size].reset_index(drop=True)
         parts.append(_query_chunk(P, chunk, offset, Q_word_all[offset:offset + chunk_size],
-                                  Q_char_all[offset:offset + chunk_size], bidir_s1, bidir_g, country))
+                                  Q_char_all[offset:offset + chunk_size], bidir_s1, bidir_g, country,
+                                  Q_phon=None if Q_phon_all is None else Q_phon_all[offset:offset + chunk_size]))
         print(f"  [{country}] blocked {min(offset + chunk_size, n_s1):,}/{n_s1:,} S1 rows", flush=True)
     parts = [x for x in parts if not x.empty]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
