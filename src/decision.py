@@ -230,27 +230,41 @@ def main(argv=None):
     ap.add_argument("--out-dir", default=str(S.OUTPUT_DIR))
     args = ap.parse_args(argv)
 
-    feats = pd.read_parquet(args.features)
-    cands = pd.read_parquet(args.candidates, columns=["source1_entity_id", "candidate_entity_id"])
     s1_ids = pd.read_csv(args.source1, sep="\t", dtype=str, keep_default_na=False, usecols=["entity_id"])["entity_id"].tolist()
 
     model_path = Path(args.model)
     if not model_path.exists() and S.MODEL_PHASE1.exists():
         print(f"{model_path} not found, falling back to {S.MODEL_PHASE1}")
         model_path = S.MODEL_PHASE1
-    probs = predict_probs(feats, model_path, Path(args.calibrator), vetoes=not args.no_vetoes)
-    pairs = feats[["source1_entity_id", "candidate_entity_id"]].copy()
-    pairs["prob"] = probs
+
+    # Stream the (possibly 50M-row) test feature matrix in batches; keep only ids + prob.
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(args.features)
+    parts = []
+    n_rows = 0
+    for batch in pf.iter_batches(batch_size=1_000_000):
+        feats = batch.to_pandas()
+        probs = predict_probs(feats, model_path, Path(args.calibrator), vetoes=not args.no_vetoes)
+        parts.append(pd.DataFrame({
+            "source1_entity_id": feats["source1_entity_id"].astype("string[pyarrow]"),
+            "candidate_entity_id": feats["candidate_entity_id"].astype("string[pyarrow]"),
+            "prob": probs.astype(np.float32),
+        }))
+        n_rows += len(feats)
+        print(f"  scored {n_rows:,} pairs", flush=True)
+    pairs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "prob"])
+    del parts
     pred = decide(pairs, formula=args.formula, exclusivity=not args.no_exclusivity, min_prob=args.min_prob)
 
     out_dir = Path(args.out_dir)
     write_matching_results(pred, s1_ids, out_dir / "matching_results.tsv")
-    write_candidate_pairs(cands, s1_ids, out_dir / "candidate_pairs.tsv")
+    # candidate_pairs.tsv = exactly the pairs the model scored (the feature matrix rows)
+    write_candidate_pairs(pairs[["source1_entity_id", "candidate_entity_id"]], s1_ids, out_dir / "candidate_pairs.tsv")
     n_match = sum(len(v) for v in pred.values())
     n_single = sum(1 for s in s1_ids if not pred.get(s))
     print(f"wrote {out_dir/'matching_results.tsv'}: {len(s1_ids):,} entities, {n_match:,} matches, "
           f"{n_single:,} singletons ({n_single/len(s1_ids):.1%})")
-    print(f"wrote {out_dir/'candidate_pairs.tsv'}: {len(cands):,} candidate pairs")
+    print(f"wrote {out_dir/'candidate_pairs.tsv'}: {len(pairs):,} candidate pairs")
 
 
 if __name__ == "__main__":
