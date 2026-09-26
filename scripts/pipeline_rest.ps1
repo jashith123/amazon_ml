@@ -16,9 +16,11 @@ if (Select-String -Path $blockLog -Pattern "exit -|Traceback|MemoryError" -Quiet
     exit 1
 }
 
-function Run-Step($name, $args) {
+function Run-Step($name, $argv) {
+    # NB: never name this parameter $args - PowerShell reserves it and it comes through empty,
+    # which launched a bare python REPL that error-looped in the hidden window.
     "=== $name $(Get-Date -Format s)" | Out-File $log -Append -Encoding utf8
-    & $py @args 2>&1 | Out-File $log -Append -Encoding utf8
+    & $py @argv 2>&1 | Out-File $log -Append -Encoding utf8
     "=== $name exit $LASTEXITCODE $(Get-Date -Format s)" | Out-File $log -Append -Encoding utf8
     if ($LASTEXITCODE -ne 0) { "STOPPED at $name" | Out-File $log -Append -Encoding utf8; exit 1 }
 }
