@@ -37,6 +37,10 @@ LEG_PHONETIC   = 32        # phonetic_block_hit (Leg F: Soundex / Metaphone)
 LEG_EMBEDDING  = 64        # embedding_block_hit (Leg G: skipped -> False)
 LEG_BIDIR      = 128       # bidirectional_block_hit (Leg C)
 
+# Contract 1 columns actually used by blocking (the CLI loads only these)
+BLOCKING_COLS = ["entity_id", "country", "name_norm", "name_core", "name_tokens",
+                 "address_norm", "address_numbers", "address_pin"]
+
 
 def adaptive_k_prune(candidates, scores, k_min=5, gap=0.1, k_max=S.MAX_CANDIDATES_PER_S1):
     """Keep rank < k_min OR score >= top1 - gap, cap at k_max (pipeline doc section 10)."""
@@ -72,6 +76,11 @@ def rowwise_dot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarr
         b = B[ib[s:e]]
         out[s:e] = np.asarray(a.multiply(b).sum(axis=1)).ravel()
     return out
+
+
+def _hash_keys(ks: pd.Series) -> np.ndarray:
+    """64-bit hash of key strings: key tables of 30M+ rows fit in RAM (strings do not)."""
+    return pd.util.hash_pandas_object(ks.astype(str), index=False).to_numpy(dtype=np.uint64)
 
 
 def _get_acronyms(tok_series: pd.Series) -> pd.Series:
@@ -141,7 +150,7 @@ def _build_key_tables(gal: pd.DataFrame, bucket_cap: int = 200, top_k_bucket: in
             if not np.any(valid):
                 continue
             t = pd.DataFrame({
-                "key": arr[valid],
+                "key": _hash_keys(ks[valid]),
                 "g": g_indices[valid],
                 "leg": np.int32(leg_bit),
             })
@@ -171,7 +180,7 @@ def _query_key_tables(q: pd.DataFrame, gal_key_table: pd.DataFrame, top_k_per_qu
             if not np.any(valid):
                 continue
             qt = pd.DataFrame({
-                "key": arr[valid],
+                "key": _hash_keys(ks[valid]),
                 "s1": s1_indices[valid],
                 "leg": np.int32(leg_bit),
             })
@@ -204,6 +213,9 @@ class _PartitionIndex:
                                         min_df=2 if n_gal > 100 else 1, max_df=0.01 if n_gal > 1000 else 1.0, dtype=np.float32)
         self.G_char = self.char_vec.fit_transform(gal_char_doc).tocsr()
         self.G_char_T = self.G_char.T.tocsr()
+        # sklearn keeps every pruned term (min_df/max_df) in stop_words_: millions of strings here
+        self.word_vec.stop_words_ = None
+        self.char_vec.stop_words_ = None
         # Legs D, E, F: key tables
         self.key_tables = _build_key_tables(gal_part, bucket_cap=200, top_k_bucket=30)
         self.gal_ids = gal_part["entity_id"].to_numpy()
@@ -331,8 +343,9 @@ def generate_candidates(s1: pd.DataFrame, gallery: pd.DataFrame, ground_truth: d
     countries = s1["country"].dropna().unique()
     partitions = []
     for c in countries:
-        s1_c = s1[s1["country"] == c].reset_index(drop=True)
-        gal_c = gallery[gallery["country"] == c].reset_index(drop=True)
+        cols = [x for x in BLOCKING_COLS if x in s1.columns]
+        s1_c = s1.loc[s1["country"] == c, cols].reset_index(drop=True)
+        gal_c = gallery.loc[gallery["country"] == c, cols].reset_index(drop=True)
         if s1_c.empty or gal_c.empty:
             continue
         part_candidates = generate_candidates_for_partition(s1_c, gal_c, str(c))
@@ -418,13 +431,13 @@ def main(argv=None):
     s1_path = nd / S.NORMALIZED_FILE.format(n=1, suffix=suffix)
     if not s1_path.exists():
         raise FileNotFoundError(f"Source 1 normalized file not found: {s1_path}")
-    s1 = pd.read_parquet(s1_path)
+    s1 = pd.read_parquet(s1_path, columns=BLOCKING_COLS)
 
     gal_dfs = []
     for n in (2, 3):
         p = nd / S.NORMALIZED_FILE.format(n=n, suffix=suffix)
         if p.exists():
-            gal_dfs.append(pd.read_parquet(p))
+            gal_dfs.append(pd.read_parquet(p, columns=BLOCKING_COLS))
     gal = pd.concat(gal_dfs, ignore_index=True) if gal_dfs else pd.DataFrame(columns=S.NORMALIZED_COLS)
 
     gt = None
