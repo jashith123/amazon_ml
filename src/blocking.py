@@ -187,122 +187,100 @@ def _query_key_tables(q: pd.DataFrame, gal_key_table: pd.DataFrame, top_k_per_qu
     return m["s1"].to_numpy(np.int64), m["g"].to_numpy(np.int64), m["leg"].to_numpy(np.int32)
 
 
-def generate_candidates_for_partition(
-    s1_part: pd.DataFrame,
-    gal_part: pd.DataFrame,
-    country: str,
-    threads: int = 4,
-) -> pd.DataFrame:
-    """Generate candidate pairs for a single country partition across all 7 legs."""
-    n_s1 = len(s1_part)
-    n_gal = len(gal_part)
-    if n_s1 == 0 or n_gal == 0:
-        return pd.DataFrame()
+class _PartitionIndex:
+    """Gallery-side structures for one country, fitted once and queried in S1 chunks."""
 
-    # Documents for TF-IDF
-    s1_word_doc = (s1_part["name_norm"].fillna("").astype(str) + " " + s1_part["address_norm"].fillna("").astype(str)).str.strip()
-    gal_word_doc = (gal_part["name_norm"].fillna("").astype(str) + " " + gal_part["address_norm"].fillna("").astype(str)).str.strip()
+    def __init__(self, gal_part: pd.DataFrame, threads: int):
+        n_gal = len(gal_part)
+        gal_word_doc = (gal_part["name_norm"].fillna("").astype(str) + " " + gal_part["address_norm"].fillna("").astype(str)).str.strip()
+        gal_char_doc = gal_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
+        # Leg A: word TF-IDF
+        self.word_vec = TfidfVectorizer(token_pattern=r"\S+", lowercase=False, sublinear_tf=True, min_df=1,
+                                        max_df=0.02 if n_gal > 1000 else 1.0, dtype=np.float32)
+        self.G_word = self.word_vec.fit_transform(gal_word_doc).tocsr()
+        self.G_word_T = self.G_word.T.tocsr()
+        # Leg B: char 3-4-gram TF-IDF on space-less name
+        self.char_vec = TfidfVectorizer(analyzer="char", ngram_range=(3, 4), lowercase=False, sublinear_tf=True,
+                                        min_df=2 if n_gal > 100 else 1, max_df=0.01 if n_gal > 1000 else 1.0, dtype=np.float32)
+        self.G_char = self.char_vec.fit_transform(gal_char_doc).tocsr()
+        self.G_char_T = self.G_char.T.tocsr()
+        # Legs D, E, F: key tables
+        self.key_tables = _build_key_tables(gal_part, bucket_cap=200, top_k_bucket=30)
+        self.gal_ids = gal_part["entity_id"].to_numpy()
+        self.n_gal = n_gal
+        self.threads = threads
 
-    s1_char_doc = s1_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
-    gal_char_doc = gal_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
+    def transform(self, s1_part: pd.DataFrame):
+        word_doc = (s1_part["name_norm"].fillna("").astype(str) + " " + s1_part["address_norm"].fillna("").astype(str)).str.strip()
+        char_doc = s1_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
+        return self.word_vec.transform(word_doc).tocsr(), self.char_vec.transform(char_doc).tocsr()
 
-    # Leg A: Word TF-IDF Vectorizer
-    word_max_df = 0.02 if n_gal > 1000 else 1.0
-    word_vec = TfidfVectorizer(
-        token_pattern=r"\S+",
-        lowercase=False,
-        sublinear_tf=True,
-        min_df=1,
-        max_df=word_max_df,
-        dtype=np.float32,
-    )
-    G_word = word_vec.fit_transform(gal_word_doc).tocsr()
-    G_word_T = G_word.T.tocsr()
-    Q_word = word_vec.transform(s1_word_doc).tocsr()
+    def bidirectional(self, Q_word_all):
+        """Leg C over the whole partition: gallery records as queries against the S1 index."""
+        C = sp_matmul_topn(self.G_word, Q_word_all.T.tocsr(), top_n=3, threshold=0.30, sort=True, n_threads=self.threads).tocoo()
+        order = np.argsort(C.col, kind="stable")
+        return C.col.astype(np.int64)[order], C.row.astype(np.int64)[order]
 
-    # Leg B: Char 4-gram TF-IDF Vectorizer
-    char_max_df = 0.01 if n_gal > 1000 else 1.0
-    char_min_df = 2 if n_gal > 100 else 1
-    char_vec = TfidfVectorizer(
-        analyzer="char",
-        ngram_range=(3, 4),
-        lowercase=False,
-        sublinear_tf=True,
-        min_df=char_min_df,
-        max_df=char_max_df,
-        dtype=np.float32,
-    )
-    G_char = char_vec.fit_transform(gal_char_doc).tocsr()
-    G_char_T = G_char.T.tocsr()
-    Q_char = char_vec.transform(s1_char_doc).tocsr()
 
-    # Query Leg A: word TF-IDF top-40
-    C_word = sp_matmul_topn(Q_word, G_word_T, top_n=40, threshold=0.15, sort=True, n_threads=threads).tocoo()
-    leg_a_s1 = C_word.row.astype(np.int64)
-    leg_a_g = C_word.col.astype(np.int64)
-    leg_a_bits = np.full(len(leg_a_s1), LEG_NAME_TFIDF, dtype=np.int32)
+def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word, Q_char,
+                 bidir_s1: np.ndarray, bidir_g: np.ndarray, country: str) -> pd.DataFrame:
+    """All legs for one chunk of S1 rows (partition-local indices offset..offset+len)."""
+    n_gal = P.n_gal
+    nq = len(s1_chunk)
+    parts_s1, parts_g, parts_legs = [], [], []
 
-    # Query Leg B: char 4-gram TF-IDF top-40
-    C_char = sp_matmul_topn(Q_char, G_char_T, top_n=40, threshold=0.30, sort=True, n_threads=threads).tocoo()
-    leg_b_s1 = C_char.row.astype(np.int64)
-    leg_b_g = C_char.col.astype(np.int64)
-    leg_b_bits = np.full(len(leg_b_s1), LEG_CHAR_NGRAM, dtype=np.int32)
+    C_word = sp_matmul_topn(Q_word, P.G_word_T, top_n=40, threshold=0.15, sort=True, n_threads=P.threads).tocoo()
+    parts_s1.append(C_word.row.astype(np.int64)); parts_g.append(C_word.col.astype(np.int64))
+    parts_legs.append(np.full(len(C_word.row), LEG_NAME_TFIDF, dtype=np.int32))
 
-    # Query Leg C: Bidirectional TF-IDF (gallery queries against S1 index)
-    C_bidir = sp_matmul_topn(G_word, Q_word.T.tocsr(), top_n=3, threshold=0.30, sort=True, n_threads=threads).tocoo()
-    leg_c_s1 = C_bidir.col.astype(np.int64)
-    leg_c_g = C_bidir.row.astype(np.int64)
-    leg_c_bits = np.full(len(leg_c_s1), LEG_BIDIR, dtype=np.int32)
+    C_char = sp_matmul_topn(Q_char, P.G_char_T, top_n=40, threshold=0.30, sort=True, n_threads=P.threads).tocoo()
+    parts_s1.append(C_char.row.astype(np.int64)); parts_g.append(C_char.col.astype(np.int64))
+    parts_legs.append(np.full(len(C_char.row), LEG_CHAR_NGRAM, dtype=np.int32))
 
-    # Legs D, E, F: Exact keys, Address keys, PIN, Phonetic keys
-    gal_key_tables = _build_key_tables(gal_part, bucket_cap=200, top_k_bucket=30)
-    key_s1, key_g, key_bits = _query_key_tables(s1_part, gal_key_tables, top_k_per_query=30)
+    lo, hi = np.searchsorted(bidir_s1, offset), np.searchsorted(bidir_s1, offset + nq)
+    if hi > lo:
+        parts_s1.append(bidir_s1[lo:hi] - offset); parts_g.append(bidir_g[lo:hi])
+        parts_legs.append(np.full(hi - lo, LEG_BIDIR, dtype=np.int32))
 
-    # Union all retrieved legs
-    parts_s1 = [leg_a_s1, leg_b_s1, leg_c_s1]
-    parts_g = [leg_a_g, leg_b_g, leg_c_g]
-    parts_legs = [leg_a_bits, leg_b_bits, leg_c_bits]
+    key_s1, key_g, key_bits = _query_key_tables(s1_chunk, P.key_tables, top_k_per_query=30)
     if len(key_s1) > 0:
-        parts_s1.append(key_s1)
-        parts_g.append(key_g)
-        parts_legs.append(key_bits)
+        parts_s1.append(key_s1); parts_g.append(key_g); parts_legs.append(key_bits)
 
-    all_s1 = np.concatenate(parts_s1)
-    all_g = np.concatenate(parts_g)
-    all_legs = np.concatenate(parts_legs)
-
+    all_s1 = np.concatenate(parts_s1); all_g = np.concatenate(parts_g); all_legs = np.concatenate(parts_legs)
     if len(all_s1) == 0:
         return pd.DataFrame()
 
-    # Deduplicate (s1, g) pairs and merge leg bitmasks
     pair_keys = all_s1 * n_gal + all_g
     order = np.argsort(pair_keys, kind="stable")
-    pair_keys = pair_keys[order]
-    all_legs = all_legs[order]
-
+    pair_keys = pair_keys[order]; all_legs = all_legs[order]
     uniq_keys, start_indices = np.unique(pair_keys, return_index=True)
     legs_u = np.bitwise_or.reduceat(all_legs, start_indices)
     s1_u = (uniq_keys // n_gal).astype(np.int32)
     g_u = (uniq_keys % n_gal).astype(np.int32)
 
-    # Compute similarity cosines for blocking score
-    word_cos = rowwise_dot(Q_word, G_word, s1_u, g_u)
-    char_cos = rowwise_dot(Q_char, G_char, s1_u, g_u)
+    word_cos = rowwise_dot(Q_word, P.G_word, s1_u, g_u)
+    char_cos = rowwise_dot(Q_char, P.G_char, s1_u, g_u)
 
-    # Ranking score for EVERY pair from the two real cosines (computed above for all pairs),
-    # plus a small bonus per key leg and for a bidirectional hit. No placeholder scores:
-    # a fixed 0.5 for key-only hits put true matches 0.4 below the top and the gap rule cut them
-    # (91% -> 98% recall on a 5k sample).
+    # Ranking score for EVERY pair from the two real cosines plus a small bonus per key leg and
+    # for a bidirectional hit. (A fixed 0.5 placeholder for key-only hits cost 8 points of recall.)
     n_key_legs = np.zeros(len(legs_u), dtype=np.float32)
     for bit in (LEG_EXACT_KEY, LEG_ADDRESS, LEG_PIN, LEG_PHONETIC):
         n_key_legs += (legs_u & bit) > 0
     blocking_score = (word_cos + char_cos + 0.25 * np.minimum(n_key_legs, 3)
                       + 0.15 * ((legs_u & LEG_BIDIR) > 0)).astype(np.float64)
 
-    s1_ids = s1_part["entity_id"].iloc[s1_u].to_numpy()
-    cand_ids = gal_part["entity_id"].iloc[g_u].to_numpy()
+    # Top-K cut per S1 BEFORE materialising string ids (keeps memory flat at full scale)
+    order = np.lexsort((-blocking_score, s1_u))
+    s1_u, g_u, legs_u, blocking_score = s1_u[order], g_u[order], legs_u[order], blocking_score[order]
+    first = np.r_[0, np.flatnonzero(np.diff(s1_u)) + 1]
+    sizes = np.diff(np.r_[first, len(s1_u)])
+    rank = np.arange(len(s1_u)) - np.repeat(first, sizes)
+    keep = rank < S.MAX_CANDIDATES_PER_S1
+    s1_u, g_u, legs_u, blocking_score = s1_u[keep], g_u[keep], legs_u[keep], blocking_score[keep]
 
-    part_df = pd.DataFrame({
+    s1_ids = s1_chunk["entity_id"].to_numpy()[s1_u]
+    cand_ids = P.gal_ids[g_u]
+    return pd.DataFrame({
         "source1_entity_id": s1_ids,
         "candidate_entity_id": cand_ids,
         "candidate_source": pd.Series(cand_ids).str[:2].to_numpy(),
@@ -316,14 +294,36 @@ def generate_candidates_for_partition(
         "embedding_block_hit": False,
         "bidirectional_block_hit": (legs_u & LEG_BIDIR) > 0,
         "num_legs_retrieved": np.unpackbits(legs_u.astype(np.uint8)[:, None], axis=1).sum(axis=1).astype(np.int64),
-        "blocking_score": blocking_score.astype(np.float64),
+        "blocking_score": blocking_score,
     })
 
-    # Top-K cut per S1 on the combined score (K = S.MAX_CANDIDATES_PER_S1). The gap rule was
-    # removed: with the cosine-based score it only lowered recall at the same K.
-    part_df.sort_values(["source1_entity_id", "blocking_score"], ascending=[True, False], inplace=True, ignore_index=True)
-    rank = part_df.groupby("source1_entity_id", sort=False).cumcount() + 1
-    return part_df[rank <= S.MAX_CANDIDATES_PER_S1].reset_index(drop=True)
+
+def generate_candidates_for_partition(
+    s1_part: pd.DataFrame,
+    gal_part: pd.DataFrame,
+    country: str,
+    threads: int = 8,
+    chunk_size: int = 100_000,
+) -> pd.DataFrame:
+    """Generate candidate pairs for a single country partition across all legs.
+
+    The gallery index is fitted once; S1 rows are queried in chunks of `chunk_size` so memory
+    stays flat for partitions with >1M Source 1 records.
+    """
+    n_s1 = len(s1_part)
+    if n_s1 == 0 or len(gal_part) == 0:
+        return pd.DataFrame()
+    P = _PartitionIndex(gal_part, threads)
+    Q_word_all, Q_char_all = P.transform(s1_part)
+    bidir_s1, bidir_g = P.bidirectional(Q_word_all)
+    parts = []
+    for offset in range(0, n_s1, chunk_size):
+        chunk = s1_part.iloc[offset:offset + chunk_size].reset_index(drop=True)
+        parts.append(_query_chunk(P, chunk, offset, Q_word_all[offset:offset + chunk_size],
+                                  Q_char_all[offset:offset + chunk_size], bidir_s1, bidir_g, country))
+        print(f"  [{country}] blocked {min(offset + chunk_size, n_s1):,}/{n_s1:,} S1 rows", flush=True)
+    parts = [x for x in parts if not x.empty]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def generate_candidates(s1: pd.DataFrame, gallery: pd.DataFrame, ground_truth: dict[str, set[str]] | None = None) -> pd.DataFrame:
