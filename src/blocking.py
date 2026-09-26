@@ -14,6 +14,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -196,6 +197,18 @@ def _query_key_tables(q: pd.DataFrame, gal_key_table: pd.DataFrame, top_k_per_qu
     return m["s1"].to_numpy(np.int64), m["g"].to_numpy(np.int64), m["leg"].to_numpy(np.int32)
 
 
+# Terms present in more than this many gallery records are dropped from the TF-IDF legs.
+# A fractional cap alone makes the retrieval cost grow quadratically with the gallery
+# (each query touches a fixed *fraction* of the index); an absolute cap bounds it.
+MAX_DF_ABS = int(os.environ.get("BLOCK_MAX_DF_ABS", "10000"))
+
+
+def _max_df(n_gal: int, frac: float):
+    if n_gal <= 1000:
+        return 1.0
+    return max(2, min(int(frac * n_gal), MAX_DF_ABS))
+
+
 class _PartitionIndex:
     """Gallery-side structures for one country, fitted once and queried in S1 chunks."""
 
@@ -205,12 +218,12 @@ class _PartitionIndex:
         gal_char_doc = gal_part["name_norm"].fillna("").astype(str).str.replace(" ", "", regex=False)
         # Leg A: word TF-IDF
         self.word_vec = TfidfVectorizer(token_pattern=r"\S+", lowercase=False, sublinear_tf=True, min_df=1,
-                                        max_df=0.02 if n_gal > 1000 else 1.0, dtype=np.float32)
+                                        max_df=_max_df(n_gal, 0.02), dtype=np.float32)
         self.G_word = self.word_vec.fit_transform(gal_word_doc).tocsr()
         self.G_word_T = self.G_word.T.tocsr()
         # Leg B: char 3-4-gram TF-IDF on space-less name
         self.char_vec = TfidfVectorizer(analyzer="char", ngram_range=(3, 4), lowercase=False, sublinear_tf=True,
-                                        min_df=2 if n_gal > 100 else 1, max_df=0.01 if n_gal > 1000 else 1.0, dtype=np.float32)
+                                        min_df=2 if n_gal > 100 else 1, max_df=_max_df(n_gal, 0.01), dtype=np.float32)
         self.G_char = self.char_vec.fit_transform(gal_char_doc).tocsr()
         self.G_char_T = self.G_char.T.tocsr()
         # sklearn keeps every pruned term (min_df/max_df) in stop_words_: millions of strings here
