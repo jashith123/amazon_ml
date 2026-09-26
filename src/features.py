@@ -7,214 +7,258 @@ relies on by exact name) and team_task_split.md. Hard requirements:
   * no NaN anywhere; sem__* = 0.0 when embeddings were skipped
   * splits written at the S1-entity level (train / val / val_us_only / val_india_only)
 
+Speed design (same 60 columns as before):
+  * every record is vectorised ONCE per country (char 2-3-gram TF-IDF, binary token set,
+    binary numeric-token set); pair metrics are sparse row-wise products by index
+  * the five edit-distance metrics use rapidfuzz.process.cpdist (multithreaded C++)
+  * pairs are processed in chunks of S1 entities and streamed to parquet as float32
+
 CLI:
-  python src/features.py --split train
+  python src/features.py --split train [--max-s1 300000]
   python src/features.py --split test
 """
 from __future__ import annotations
 
 import argparse
 import sys
-import os
-import re
+import time
 from pathlib import Path
 
+import jellyfish
 import numpy as np
 import pandas as pd
-import rapidfuzz
-import rapidfuzz.distance
-import jellyfish
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import paired_cosine_distances
+import pyarrow as pa
+import pyarrow.parquet as pq
+import scipy.sparse as sp
+from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.process import cpdist
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import schema as S  # noqa: E402
 
-
-def _get_base_metrics(a: pd.Series, b: pd.Series, prefix: str, fit_corpus: np.ndarray) -> pd.DataFrame:
-    a = a.fillna("").astype(str)
-    b = b.fillna("").astype(str)
-    
-    # 1. lev_ratio
-    lev = [rapidfuzz.fuzz.ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    # 2. jaro_winkler
-    jw = [rapidfuzz.distance.JaroWinkler.normalized_similarity(x, y) for x, y in zip(a, b)]
-    
-    # 3. char_tfidf_cosine
-    vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2,3))
-    vec.fit(fit_corpus)
-    if len(a) > 0:
-        tfidf_a = vec.transform(a)
-        tfidf_b = vec.transform(b)
-        tfidf_cos = (1.0 - paired_cosine_distances(tfidf_a, tfidf_b)).tolist()
-    else:
-        tfidf_cos = []
-    
-    # 4. token_jaccard
-    def tok_jac(x, y):
-        sx, sy = set(x.split()), set(y.split())
-        if not sx and not sy: return 0.0
-        return len(sx & sy) / len(sx | sy)
-    t_jac = [tok_jac(x, y) for x, y in zip(a, b)]
-    
-    # 5. token_overlap
-    def tok_ov(x, y):
-        sx, sy = set(x.split()), set(y.split())
-        if not sx or not sy: return 0.0
-        return len(sx & sy) / min(len(sx), len(sy))
-    t_ov = [tok_ov(x, y) for x, y in zip(a, b)]
-    
-    # 6. token_sort_ratio
-    tsr = [rapidfuzz.fuzz.token_sort_ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    
-    # 7. trigram_jaccard
-    def tri_jac(x, y):
-        sx = set([x[i:i+3] for i in range(len(x)-2)]) if len(x) >= 3 else set([x])
-        sy = set([y[i:i+3] for i in range(len(y)-2)]) if len(y) >= 3 else set([y])
-        sx.discard("")
-        sy.discard("")
-        if not sx and not sy: return 0.0
-        if not sx or not sy: return 0.0
-        return len(sx & sy) / len(sx | sy)
-    tr_jac = [tri_jac(x, y) for x, y in zip(a, b)]
-    
-    # 8. prefix_overlap
-    pref_ov = [len(os.path.commonprefix([x, y])) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 0.0 for x, y in zip(a, b)]
-    
-    # 9. length_diff
-    l_diff = [float(abs(len(x) - len(y))) for x, y in zip(a, b)]
-    
-    # 10. partial_ratio
-    pr = [rapidfuzz.fuzz.partial_ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    
-    # 11. token_set_ratio
-    tset = [rapidfuzz.fuzz.token_set_ratio(x, y) / 100.0 for x, y in zip(a, b)]
-    
-    # 12. length_ratio
-    l_rat = [min(len(x), len(y)) / max(len(x), len(y)) if max(len(x), len(y)) > 0 else 1.0 for x, y in zip(a, b)]
-    
-    return pd.DataFrame({
-        f"{prefix}lev_ratio": lev,
-        f"{prefix}jaro_winkler": jw,
-        f"{prefix}char_tfidf_cosine": tfidf_cos,
-        f"{prefix}token_jaccard": t_jac,
-        f"{prefix}token_overlap": t_ov,
-        f"{prefix}token_sort_ratio": tsr,
-        f"{prefix}trigram_jaccard": tr_jac,
-        f"{prefix}prefix_overlap": pref_ov,
-        f"{prefix}length_diff": l_diff,
-        f"{prefix}partial_ratio": pr,
-        f"{prefix}token_set_ratio": tset,
-        f"{prefix}length_ratio": l_rat,
-    }, index=a.index)
+CHAR_VEC_FIT_SAMPLE = 200_000
+BASE_METRICS = ["lev_ratio", "jaro_winkler", "char_tfidf_cosine", "token_jaccard", "token_overlap",
+                "token_sort_ratio", "trigram_jaccard", "prefix_overlap", "length_diff", "partial_ratio",
+                "token_set_ratio", "length_ratio"]
 
 
-def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, gallery: pd.DataFrame) -> pd.DataFrame:
-    """Contract 2 pairs + Contract 1 records -> Contract 3 frame (label kept if present)."""
-    df = pairs.merge(s1.add_prefix("s1_"), left_on="source1_entity_id", right_on="s1_entity_id", how="left")
-    df = df.merge(gallery.add_prefix("cand_"), left_on="candidate_entity_id", right_on="cand_entity_id", how="left")
-    
-    name_corpus = pd.concat([s1["name_norm"], gallery["name_norm"]]).fillna("").unique()
-    addr_corpus = pd.concat([s1["address_norm"], gallery["address_norm"]]).fillna("").unique()
-    
-    name_base = _get_base_metrics(df["s1_name_norm"], df["cand_name_norm"], "name__", name_corpus)
-    addr_base = _get_base_metrics(df["s1_address_norm"], df["cand_address_norm"], "addr__", addr_corpus)
-    
-    a_norm, b_norm = df['s1_name_norm'].fillna(""), df['cand_name_norm'].fillna("")
-    a_core, b_core = df['s1_name_core'].fillna(""), df['cand_name_core'].fillna("")
-    a_suff, b_suff = df['s1_legal_suffix'].fillna(""), df['cand_legal_suffix'].fillna("")
-    
-    exact_norm = (a_norm == b_norm).astype(float)
-    exact_core = (a_core == b_core).astype(float)
-    
-    a_phon = a_core.apply(lambda x: jellyfish.soundex(x) if x else "")
-    b_phon = b_core.apply(lambda x: jellyfish.soundex(x) if x else "")
-    phonetic_match = ((a_phon == b_phon) & (a_phon != "")).astype(float)
-    
-    suff_match = ((a_suff == b_suff) & (a_suff != "")).astype(float)
-    suff_conf = ((a_suff != b_suff) & (a_suff != "") & (b_suff != "")).astype(float)
-    exact_raw = (df['s1_name_raw'].fillna("") == df['cand_name_raw'].fillna("")).astype(float)
-    
-    name_spec = pd.DataFrame({
-        "name__exact_norm_match": exact_norm,
-        "name__exact_core_match": exact_core,
-        "name__phonetic_match": phonetic_match,
-        "name__suffix_match": suff_match,
-        "name__suffix_conflict": suff_conf,
-        "name__exact_raw_match": exact_raw,
-    }, index=df.index)
-    
-    a_hn, b_hn = df['s1_address_numbers'].fillna(""), df['cand_address_numbers'].fillna("")
-    a_pin, b_pin = df['s1_address_pin'].fillna(""), df['cand_address_pin'].fillna("")
-    a_raw, b_raw = df['s1_address_raw'].fillna(""), df['cand_address_raw'].fillna("")
-    
-    hn_exact = ((a_hn == b_hn) & (a_hn != "")).astype(float)
-    hn_conf = ((a_hn != b_hn) & (a_hn != "") & (b_hn != "")).astype(float)
-    pin_exact = ((a_pin == b_pin) & (a_pin != "")).astype(float)
-    both_have = ((a_raw != "") & (b_raw != "")).astype(float)
-    
-    addr_spec = pd.DataFrame({
-        "addr__house_number_exact": hn_exact,
-        "addr__house_number_conflict": hn_conf,
-        "addr__pin_exact": pin_exact,
-        "addr__both_have_address": both_have,
-    }, index=df.index)
-    
-    feats = pd.concat([name_base, name_spec, addr_base, addr_spec], axis=1)
-    
-    name_sim = feats["name__lev_ratio"]
-    addr_sim = feats["addr__lev_ratio"]
-    
-    feats["cross__name_addr_product"] = name_sim * addr_sim
-    feats["cross__name_addr_sum"] = name_sim + addr_sim
-    feats["cross__name_addr_min"] = np.minimum(name_sim, addr_sim)
-    feats["cross__name_addr_max"] = np.maximum(name_sim, addr_sim)
-    feats["cross__name_high_addr_low"] = ((name_sim > 0.8) & (addr_sim < 0.5)).astype(float)
-    feats["cross__name_low_addr_high"] = ((name_sim < 0.5) & (addr_sim > 0.8)).astype(float)
-    feats["cross__name_addr_diff"] = np.abs(name_sim - addr_sim)
-    feats["cross__name_addr_harmonic"] = (2 * name_sim * addr_sim) / (name_sim + addr_sim + 1e-6)
-    
-    feats["cross__country_exact_match"] = (df['country'] == df['cand_country']).astype(float)
-    
-    def extract_nums(s): return set(re.findall(r'\d+', str(s)))
-    s1_nums = (df['s1_name_raw'].fillna("") + " " + df['s1_address_raw'].fillna("")).apply(extract_nums)
-    s2_nums = (df['cand_name_raw'].fillna("") + " " + df['cand_address_raw'].fillna("")).apply(extract_nums)
-    feats["cross__numeric_conflict"] = [float(bool(n1 and n2 and not (n1 & n2))) for n1, n2 in zip(s1_nums, s2_nums)]
-    
+# --------------------------------------------------------------------------- #
+# sparse helpers
+# --------------------------------------------------------------------------- #
+
+def _rowwise_dot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray,
+                 chunk: int = 500_000) -> np.ndarray:
+    out = np.empty(len(ia), dtype=np.float32)
+    for s in range(0, len(ia), chunk):
+        a = A[ia[s:s + chunk]]
+        b = B[ib[s:s + chunk]]
+        out[s:s + chunk] = np.asarray(a.multiply(b).sum(axis=1)).ravel()
+    return out
+
+
+def _nnz_per_row(M: sp.csr_matrix) -> np.ndarray:
+    return np.diff(M.indptr).astype(np.float32)
+
+
+def _safe_div(num, den, fill=0.0):
+    den = np.asarray(den, dtype=np.float32)
+    out = np.full(len(den), fill, dtype=np.float32)
+    ok = den > 0
+    out[ok] = np.asarray(num, dtype=np.float32)[ok] / den[ok]
+    return out
+
+
+def _common_prefix_len(a: list[str], b: list[str]) -> np.ndarray:
+    out = np.empty(len(a), dtype=np.float32)
+    for i, (x, y) in enumerate(zip(a, b)):
+        n = min(len(x), len(y))
+        j = 0
+        while j < n and x[j] == y[j]:
+            j += 1
+        out[i] = j
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# per-record representations (computed once per country)
+# --------------------------------------------------------------------------- #
+
+def fit_char_vectorizers(s1: pd.DataFrame, gallery: pd.DataFrame, seed: int = S.RANDOM_SEED):
+    """char_wb 2-3-gram TF-IDF for names and addresses, fitted on <= 200k unique strings."""
+    rng = np.random.RandomState(seed)
+    vecs = {}
+    for field in ("name_norm", "address_norm"):
+        corpus = pd.concat([s1[field], gallery[field]]).fillna("").astype(str)
+        corpus = corpus[corpus != ""].unique()
+        if len(corpus) > CHAR_VEC_FIT_SAMPLE:
+            corpus = rng.choice(corpus, CHAR_VEC_FIT_SAMPLE, replace=False)
+        vecs[field] = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3), lowercase=False,
+                                      dtype=np.float32).fit(corpus)
+    return vecs["name_norm"], vecs["address_norm"]
+
+
+class RecordReps:
+    """Vectorised views of every record (S1 + gallery) of one country, indexed by entity_id."""
+
+    def __init__(self, recs: pd.DataFrame, name_vec: TfidfVectorizer, addr_vec: TfidfVectorizer):
+        recs = recs.reset_index(drop=True)
+        self.ids = pd.Index(recs["entity_id"].astype(str))
+        g = lambda c: recs[c].fillna("").astype(str)  # noqa: E731
+        self.name_norm = g("name_norm").to_numpy(dtype=object)
+        self.name_core = g("name_core").to_numpy(dtype=object)
+        self.name_raw = g("name_raw").to_numpy(dtype=object)
+        self.suffix = g("legal_suffix").to_numpy(dtype=object)
+        self.addr_norm = g("address_norm").to_numpy(dtype=object)
+        self.addr_raw = g("address_raw").to_numpy(dtype=object)
+        self.pin = g("address_pin").to_numpy(dtype=object)
+        self.first_num = g("address_numbers").str.split("|").str[0].fillna("").to_numpy(dtype=object)
+        self.country = g("country").to_numpy(dtype=object)
+        self.name_len = g("name_norm").str.len().to_numpy(np.float32)
+        self.addr_len = g("address_norm").str.len().to_numpy(np.float32)
+        # soundex of name_core, computed once per unique value
+        core_series = g("name_core")
+        uniq = core_series.unique()
+        sdx = {u: (jellyfish.soundex(u) if u else "") for u in uniq}
+        self.soundex = core_series.map(sdx).to_numpy(dtype=object)
+        # char TF-IDF (l2-normed -> dot = cosine) and its binary presence for n-gram jaccard
+        self.name_tfidf = name_vec.transform(self.name_norm).tocsr()
+        self.addr_tfidf = addr_vec.transform(self.addr_norm).tocsr()
+        self.name_bin = self.name_tfidf.sign().tocsr()
+        self.addr_bin = self.addr_tfidf.sign().tocsr()
+        # binary token sets
+        tok_vec = CountVectorizer(token_pattern=r"\S+", lowercase=False, binary=True, dtype=np.float32)
+        self.name_tok = tok_vec.fit_transform(self.name_norm).tocsr()
+        tok_vec_a = CountVectorizer(token_pattern=r"\S+", lowercase=False, binary=True, dtype=np.float32)
+        self.addr_tok = tok_vec_a.fit_transform(self.addr_norm).tocsr()
+        # binary numeric tokens from raw name + raw address (cross__numeric_conflict)
+        num_vec = CountVectorizer(token_pattern=r"\d+", lowercase=False, binary=True, dtype=np.float32)
+        joined = [f"{a} {b}" for a, b in zip(self.name_raw, self.addr_raw)]
+        self.nums = num_vec.fit_transform(joined).tocsr()
+
+    def index_of(self, ids) -> np.ndarray:
+        idx = self.ids.get_indexer(pd.Index(ids).astype(str))
+        if (idx < 0).any():
+            raise KeyError(f"{(idx < 0).sum()} candidate/S1 ids not found in normalized records")
+        return idx
+
+
+# --------------------------------------------------------------------------- #
+# pairwise features
+# --------------------------------------------------------------------------- #
+
+def _base_metrics(prefix: str, strs: np.ndarray, tfidf: sp.csr_matrix, binm: sp.csr_matrix,
+                  tok: sp.csr_matrix, lens: np.ndarray, ia: np.ndarray, ib: np.ndarray) -> dict[str, np.ndarray]:
+    a = strs[ia].tolist()
+    b = strs[ib].tolist()
+    f = {}
+    f[f"{prefix}lev_ratio"] = cpdist(a, b, scorer=fuzz.ratio, workers=-1, dtype=np.float32) / 100.0
+    f[f"{prefix}jaro_winkler"] = cpdist(a, b, scorer=JaroWinkler.normalized_similarity, workers=-1, dtype=np.float32)
+    f[f"{prefix}token_sort_ratio"] = cpdist(a, b, scorer=fuzz.token_sort_ratio, workers=-1, dtype=np.float32) / 100.0
+    f[f"{prefix}partial_ratio"] = cpdist(a, b, scorer=fuzz.partial_ratio, workers=-1, dtype=np.float32) / 100.0
+    f[f"{prefix}token_set_ratio"] = cpdist(a, b, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100.0
+    f[f"{prefix}char_tfidf_cosine"] = _rowwise_dot(tfidf, tfidf, ia, ib)
+    nbin = _nnz_per_row(binm)
+    inter = _rowwise_dot(binm, binm, ia, ib)
+    f[f"{prefix}trigram_jaccard"] = _safe_div(inter, nbin[ia] + nbin[ib] - inter)
+    ntok = _nnz_per_row(tok)
+    tinter = _rowwise_dot(tok, tok, ia, ib)
+    f[f"{prefix}token_jaccard"] = _safe_div(tinter, ntok[ia] + ntok[ib] - tinter)
+    f[f"{prefix}token_overlap"] = _safe_div(tinter, np.minimum(ntok[ia], ntok[ib]))
+    la, lb = lens[ia], lens[ib]
+    mx = np.maximum(la, lb)
+    f[f"{prefix}prefix_overlap"] = _safe_div(_common_prefix_len(a, b), mx)
+    f[f"{prefix}length_diff"] = np.abs(la - lb).astype(np.float32)
+    f[f"{prefix}length_ratio"] = _safe_div(np.minimum(la, lb), mx, fill=1.0)
+    return f
+
+
+def build_features(pairs: pd.DataFrame, s1: pd.DataFrame | None = None, gallery: pd.DataFrame | None = None,
+                   reps: RecordReps | None = None, name_vec=None, addr_vec=None) -> pd.DataFrame:
+    """Contract 2 pairs + Contract 1 records -> Contract 3 frame (label kept if present).
+
+    Pass `reps` (precomputed once per country) for speed; otherwise it is built from s1+gallery.
+    """
+    if reps is None:
+        if name_vec is None or addr_vec is None:
+            name_vec, addr_vec = fit_char_vectorizers(s1, gallery)
+        reps = RecordReps(pd.concat([s1, gallery], ignore_index=True), name_vec, addr_vec)
+    pairs = pairs.reset_index(drop=True)
+    ia = reps.index_of(pairs["source1_entity_id"])
+    ib = reps.index_of(pairs["candidate_entity_id"])
+
+    f: dict[str, np.ndarray] = {}
+    f.update(_base_metrics("name__", reps.name_norm, reps.name_tfidf, reps.name_bin, reps.name_tok, reps.name_len, ia, ib))
+    f["name__exact_norm_match"] = (reps.name_norm[ia] == reps.name_norm[ib]).astype(np.float32)
+    f["name__exact_core_match"] = (reps.name_core[ia] == reps.name_core[ib]).astype(np.float32)
+    sa, sb = reps.soundex[ia], reps.soundex[ib]
+    f["name__phonetic_match"] = ((sa == sb) & (sa != "")).astype(np.float32)
+    xa, xb = reps.suffix[ia], reps.suffix[ib]
+    f["name__suffix_match"] = ((xa == xb) & (xa != "")).astype(np.float32)
+    f["name__suffix_conflict"] = ((xa != xb) & (xa != "") & (xb != "")).astype(np.float32)
+    f["name__exact_raw_match"] = (reps.name_raw[ia] == reps.name_raw[ib]).astype(np.float32)
+
+    f.update(_base_metrics("addr__", reps.addr_norm, reps.addr_tfidf, reps.addr_bin, reps.addr_tok, reps.addr_len, ia, ib))
+    ha, hb = reps.first_num[ia], reps.first_num[ib]
+    f["addr__house_number_exact"] = ((ha == hb) & (ha != "")).astype(np.float32)
+    f["addr__house_number_conflict"] = ((ha != hb) & (ha != "") & (hb != "")).astype(np.float32)
+    pa_, pb_ = reps.pin[ia], reps.pin[ib]
+    f["addr__pin_exact"] = ((pa_ == pb_) & (pa_ != "")).astype(np.float32)
+    f["addr__both_have_address"] = ((reps.addr_raw[ia] != "") & (reps.addr_raw[ib] != "")).astype(np.float32)
+
+    name_sim = f["name__lev_ratio"]
+    addr_sim = f["addr__lev_ratio"]
+    f["cross__name_addr_product"] = name_sim * addr_sim
+    f["cross__name_addr_sum"] = name_sim + addr_sim
+    f["cross__name_addr_min"] = np.minimum(name_sim, addr_sim)
+    f["cross__name_addr_max"] = np.maximum(name_sim, addr_sim)
+    f["cross__name_high_addr_low"] = ((name_sim > 0.8) & (addr_sim < 0.5)).astype(np.float32)
+    f["cross__name_low_addr_high"] = ((name_sim < 0.5) & (addr_sim > 0.8)).astype(np.float32)
+    f["cross__name_addr_diff"] = np.abs(name_sim - addr_sim)
+    f["cross__name_addr_harmonic"] = (2 * name_sim * addr_sim) / (name_sim + addr_sim + 1e-6)
+    f["cross__country_exact_match"] = (reps.country[ia] == reps.country[ib]).astype(np.float32)
+    nn = _nnz_per_row(reps.nums)
+    ninter = _rowwise_dot(reps.nums, reps.nums, ia, ib)
+    f["cross__numeric_conflict"] = ((nn[ia] > 0) & (nn[ib] > 0) & (ninter == 0)).astype(np.float32)
+
     for c in S.BLOCK_FLAG_COLS:
-        feats[f"block__{c}"] = df[c].fillna(0).astype(float)
-    feats["block__num_legs_retrieved"] = df["num_legs_retrieved"].astype(float)
-    
-    grp = df.groupby("source1_entity_id")["blocking_score"]
-    feats["comp__rank"] = grp.rank(ascending=False, method="first")
-    feats["comp__score_percentile"] = grp.rank(pct=True)
-    feats["comp__score_gap_top1"] = grp.transform("max") - df["blocking_score"]
-    
-    feats["sem__embedding_cosine"] = 0.0
-    feats["sem__embedding_rank"] = 0.0
-    feats["sem__embedding_percentile"] = 0.0
-    feats["sem__embedding_gap"] = 0.0
-    
-    feats["source1_entity_id"] = df["source1_entity_id"]
-    feats["candidate_entity_id"] = df["candidate_entity_id"]
-    feats["candidate_source"] = df["candidate_source"]
-    feats["country"] = df["country"]
-    if S.LABEL_COL in df.columns:
-        feats[S.LABEL_COL] = df[S.LABEL_COL]
-        
-    for c in feats.columns:
-        if c.startswith(S.FEATURE_PREFIXES):
-            feats[c] = feats[c].fillna(0.0)
-            
+        f[f"block__{c}"] = pairs[c].fillna(0).to_numpy().astype(np.float32)
+    f["block__num_legs_retrieved"] = pairs["num_legs_retrieved"].to_numpy().astype(np.float32)
+
+    grp = pairs.groupby("source1_entity_id", sort=False)["blocking_score"]
+    f["comp__rank"] = grp.rank(ascending=False, method="first").to_numpy(np.float32)
+    f["comp__score_percentile"] = grp.rank(pct=True).to_numpy(np.float32)
+    f["comp__score_gap_top1"] = (grp.transform("max") - pairs["blocking_score"]).to_numpy(np.float32)
+
+    for c in ("sem__embedding_cosine", "sem__embedding_rank", "sem__embedding_percentile", "sem__embedding_gap"):
+        f[c] = np.zeros(len(pairs), dtype=np.float32)
+
+    feats = pd.DataFrame(f)
+    for c in S.feature_columns(feats.columns):
+        feats[c] = np.nan_to_num(feats[c].to_numpy(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    feats.insert(0, "country", pairs["country"].to_numpy())
+    feats.insert(0, "candidate_source", pairs["candidate_source"].to_numpy())
+    feats.insert(0, "candidate_entity_id", pairs["candidate_entity_id"].to_numpy())
+    feats.insert(0, "source1_entity_id", pairs["source1_entity_id"].to_numpy())
+    if S.LABEL_COL in pairs.columns:
+        feats[S.LABEL_COL] = pairs[S.LABEL_COL].to_numpy().astype(np.int8)
     return feats
 
 
-def write_splits(feats: pd.DataFrame, splits_dir: Path = S.SPLITS_DIR, val_frac: float = 0.2) -> None:
-    """Entity-level 80/20 split plus per-country validation lists (open country set)."""
+# --------------------------------------------------------------------------- #
+# splits + validation
+# --------------------------------------------------------------------------- #
+
+def write_splits(entities: pd.DataFrame, splits_dir: Path = S.SPLITS_DIR, val_frac: float = 0.2) -> None:
+    """Entity-level 80/20 split plus per-country validation lists (open country set).
+
+    `entities`: frame with unique source1_entity_id + country.
+    """
     splits_dir.mkdir(parents=True, exist_ok=True)
-    ents = feats.drop_duplicates("source1_entity_id")[["source1_entity_id", "country"]]
+    ents = entities.drop_duplicates("source1_entity_id")[["source1_entity_id", "country"]]
     rng = np.random.RandomState(S.RANDOM_SEED)
-    ids = ents["source1_entity_id"].to_numpy()
+    ids = ents["source1_entity_id"].to_numpy(dtype=object)
     perm = rng.permutation(len(ids))
     n_val = int(val_frac * len(ids))
     val_ids, train_ids = ids[perm[:n_val]], ids[perm[n_val:]]
@@ -238,27 +282,78 @@ def validate_contract3(feats: pd.DataFrame, train: bool) -> None:
     assert (S.LABEL_COL in feats.columns) == train
 
 
+# --------------------------------------------------------------------------- #
+# CLI: per-country, chunked, streamed to parquet
+# --------------------------------------------------------------------------- #
+
+def _load(nd: Path, suffix: str):
+    s1 = pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=1, suffix=suffix))
+    gal = pd.concat([pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=n, suffix=suffix)) for n in (2, 3)], ignore_index=True)
+    return s1, gal
+
+
+def run(split: str, normalized_dir: Path, out_path: Path, max_s1: int | None = None,
+        chunk_s1: int = 100_000, cand_path: Path | None = None) -> None:
+    t0 = time.time()
+    suffix = "" if split == "train" else "_test"
+    s1, gal = _load(normalized_dir, suffix)
+    pairs = pd.read_parquet(cand_path or (S.CANDIDATES_TRAIN if split == "train" else S.CANDIDATES_TEST))
+    if split == "train":
+        pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
+        pairs[S.LABEL_COL] = pairs[S.LABEL_COL].astype(int)
+        if max_s1 and pairs["source1_entity_id"].nunique() > max_s1:
+            ents = pairs.drop_duplicates("source1_entity_id")[["source1_entity_id", "country"]]
+            keep = ents.groupby("country", group_keys=False).sample(frac=max_s1 / len(ents), random_state=S.RANDOM_SEED)
+            pairs = pairs[pairs["source1_entity_id"].isin(keep["source1_entity_id"])].reset_index(drop=True)
+            print(f"train: sampled {pairs['source1_entity_id'].nunique():,} S1 entities -> {len(pairs):,} pairs")
+    print(f"loaded: {len(s1):,} S1, {len(gal):,} gallery, {len(pairs):,} pairs in {time.time()-t0:.0f}s", flush=True)
+
+    name_vec, addr_vec = fit_char_vectorizers(s1, gal)
+    print(f"char vectorizers fitted ({time.time()-t0:.0f}s)", flush=True)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = None
+    n_rows = 0
+    entities = []
+    for country in pairs["country"].unique():
+        pc = pairs[pairs["country"] == country]
+        used_ids = set(pc["source1_entity_id"]) | set(pc["candidate_entity_id"])
+        recs = pd.concat([s1[s1["entity_id"].isin(used_ids)], gal[gal["entity_id"].isin(used_ids)]], ignore_index=True)
+        reps = RecordReps(recs, name_vec, addr_vec)
+        del recs
+        print(f"[{country}] {len(pc):,} pairs, {len(reps.ids):,} records vectorised ({time.time()-t0:.0f}s)", flush=True)
+        s1_ids = pc["source1_entity_id"].unique()
+        for i in range(0, len(s1_ids), chunk_s1):
+            chunk = pc[pc["source1_entity_id"].isin(set(s1_ids[i:i + chunk_s1]))]
+            feats = build_features(chunk, reps=reps)
+            if writer is None:
+                validate_contract3(feats, train=split == "train")
+                writer = pq.ParquetWriter(str(out_path), pa.Table.from_pandas(feats.head(1), preserve_index=False).schema)
+            writer.write_table(pa.Table.from_pandas(feats, preserve_index=False))
+            n_rows += len(feats)
+            entities.append(feats[["source1_entity_id", "country"]].drop_duplicates())
+            print(f"  [{country}] {min(i + chunk_s1, len(s1_ids)):,}/{len(s1_ids):,} S1 -> {n_rows:,} rows ({time.time()-t0:.0f}s)", flush=True)
+        del reps
+    if writer is not None:
+        writer.close()
+    if split == "train" and entities:
+        write_splits(pd.concat(entities, ignore_index=True))
+    n_feat = len(S.feature_columns(pq.read_schema(str(out_path)).names)) if n_rows else 0
+    print(f"wrote {out_path}: {n_rows:,} rows, {n_feat} features in {time.time()-t0:.0f}s")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Stage 6-7: features + splits")
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--normalized-dir", default=str(S.NORMALIZED_DIR))
+    ap.add_argument("--candidates", default=None, help="override Contract 2 input path")
+    ap.add_argument("--out", default=None, help="override Contract 3 output path")
+    ap.add_argument("--max-s1", type=int, default=None, help="train only: sample this many S1 entities (stratified by country)")
+    ap.add_argument("--chunk-s1", type=int, default=100_000)
     args = ap.parse_args(argv)
-    suffix = "" if args.split == "train" else "_test"
-    nd = Path(args.normalized_dir)
-    s1 = pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=1, suffix=suffix))
-    gal = pd.concat([pd.read_parquet(nd / S.NORMALIZED_FILE.format(n=n, suffix=suffix)) for n in (2, 3)], ignore_index=True)
-    pairs = pd.read_parquet(S.CANDIDATES_TRAIN if args.split == "train" else S.CANDIDATES_TEST)
-    if args.split == "train":
-        pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
-        pairs[S.LABEL_COL] = pairs[S.LABEL_COL].astype(int)
-    feats = build_features(pairs, s1, gal)
-    validate_contract3(feats, train=args.split == "train")
-    path = S.FEATURES_TRAIN if args.split == "train" else S.FEATURES_TEST
-    path.parent.mkdir(parents=True, exist_ok=True)
-    feats.to_parquet(path, index=False)
-    if args.split == "train":
-        write_splits(feats)
-    print(f"wrote {path}: {len(feats):,} rows, {len(S.feature_columns(feats.columns))} features")
+    out = Path(args.out) if args.out else (S.FEATURES_TRAIN if args.split == "train" else S.FEATURES_TEST)
+    run(args.split, Path(args.normalized_dir), out, max_s1=args.max_s1, chunk_s1=args.chunk_s1,
+        cand_path=Path(args.candidates) if args.candidates else None)
 
 
 if __name__ == "__main__":
