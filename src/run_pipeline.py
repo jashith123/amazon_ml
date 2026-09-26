@@ -25,6 +25,11 @@ def sh(*args):
     subprocess.run([PY, *map(str, args)], check=True)
 
 
+def ensure_dirs():
+    for d in (S.NORMALIZED_DIR, S.CANDIDATES_DIR, S.FEATURES_DIR, S.SPLITS_DIR, S.MODELS_DIR, S.OUTPUT_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
 def stage_normalize():
     ds = S.dataset_dir()
     for split, suffix in (("train", ""), ("test", "_test")):
@@ -66,6 +71,7 @@ def main(argv=None):
     ap.add_argument("--stages", default="all", help="comma list of: " + ",".join(STAGES))
     args = ap.parse_args(argv)
     names = list(STAGES) if args.stages == "all" else args.stages.split(",")
+    ensure_dirs()
     for n in names:
         print(f"\n===== stage: {n} =====", flush=True)
         STAGES[n]()
