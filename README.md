@@ -31,7 +31,7 @@ code/business_entity_resolution/  <- final submission package is assembled here 
 ```bash
 python -m venv .venv                     # Python 3.10+ (we run 3.14)
 .venv/Scripts/activate                   # Windows;  source .venv/bin/activate on mac/linux
-pip install -r requirements.txt
+pip install -r requirements.txt      # any Python 3.10+; exact 3.14 versions in requirements-lock-py314.txt
 python samples/make_fixtures.py          # builds the fixtures for all contracts
 ```
 

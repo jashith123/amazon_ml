@@ -1,13 +1,14 @@
-anyascii==0.3.3
-indic_transliteration==2.3.82
-jellyfish==1.2.1
-joblib==1.6.0
-lightgbm==4.7.0
-numpy==2.5.3
-pandas==3.0.6
-pyarrow==25.0.1
-RapidFuzz==3.14.6
-scikit-learn==1.9.1
-scipy==1.18.1
-sparse-dot-topn==1.2.0
-threadpoolctl==3.7.0
+# Permissive pins: works on Python 3.10 - 3.14 (pip picks the newest compatible version).
+# The exact versions we ran with are in requirements-lock-py314.txt (Python 3.14).
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+lightgbm>=4.3
+rapidfuzz>=3.9
+pyarrow>=15
+sparse-dot-topn>=1.1
+anyascii>=0.3
+jellyfish>=1.0
+indic_transliteration>=2.3
+joblib>=1.3
