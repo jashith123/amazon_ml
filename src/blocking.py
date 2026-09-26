@@ -289,15 +289,15 @@ def generate_candidates_for_partition(
     word_cos = rowwise_dot(Q_word, G_word, s1_u, g_u)
     char_cos = rowwise_dot(Q_char, G_char, s1_u, g_u)
 
-    has_tfidf = (legs_u & (LEG_NAME_TFIDF | LEG_CHAR_NGRAM | LEG_BIDIR)) > 0
-    max_tfidf_cos = np.maximum(
-        np.where((legs_u & (LEG_NAME_TFIDF | LEG_BIDIR)) > 0, word_cos, 0.0),
-        np.where((legs_u & LEG_CHAR_NGRAM) > 0, char_cos, 0.0),
-    )
-    # Per prompt: max TF-IDF cosine if TF-IDF hit with real score; placeholder 0.5 for exact/phonetic hits
-    blocking_score = np.where(has_tfidf & (max_tfidf_cos > 0.0), max_tfidf_cos, 0.5)
-    is_key_hit = (legs_u & (LEG_EXACT_KEY | LEG_ADDRESS | LEG_PIN | LEG_PHONETIC)) > 0
-    blocking_score = np.where(is_key_hit, np.maximum(blocking_score, 0.5), blocking_score)
+    # Ranking score for EVERY pair from the two real cosines (computed above for all pairs),
+    # plus a small bonus per key leg and for a bidirectional hit. No placeholder scores:
+    # a fixed 0.5 for key-only hits put true matches 0.4 below the top and the gap rule cut them
+    # (91% -> 98% recall on a 5k sample).
+    n_key_legs = np.zeros(len(legs_u), dtype=np.float32)
+    for bit in (LEG_EXACT_KEY, LEG_ADDRESS, LEG_PIN, LEG_PHONETIC):
+        n_key_legs += (legs_u & bit) > 0
+    blocking_score = (word_cos + char_cos + 0.25 * np.minimum(n_key_legs, 3)
+                      + 0.15 * ((legs_u & LEG_BIDIR) > 0)).astype(np.float64)
 
     s1_ids = s1_part["entity_id"].iloc[s1_u].to_numpy()
     cand_ids = gal_part["entity_id"].iloc[g_u].to_numpy()
@@ -305,7 +305,7 @@ def generate_candidates_for_partition(
     part_df = pd.DataFrame({
         "source1_entity_id": s1_ids,
         "candidate_entity_id": cand_ids,
-        "candidate_source": [cid[:2] for cid in cand_ids],
+        "candidate_source": pd.Series(cand_ids).str[:2].to_numpy(),
         "country": country,
         "name_tfidf_block_hit": (legs_u & LEG_NAME_TFIDF) > 0,
         "char_ngram_block_hit": (legs_u & LEG_CHAR_NGRAM) > 0,
@@ -315,18 +315,15 @@ def generate_candidates_for_partition(
         "phonetic_block_hit": (legs_u & LEG_PHONETIC) > 0,
         "embedding_block_hit": False,
         "bidirectional_block_hit": (legs_u & LEG_BIDIR) > 0,
-        "num_legs_retrieved": [int(bin(int(l)).count("1")) for l in legs_u],
+        "num_legs_retrieved": np.unpackbits(legs_u.astype(np.uint8)[:, None], axis=1).sum(axis=1).astype(np.int64),
         "blocking_score": blocking_score.astype(np.float64),
     })
 
-    # Adaptive-K prune to <= S.MAX_CANDIDATES_PER_S1
+    # Top-K cut per S1 on the combined score (K = S.MAX_CANDIDATES_PER_S1). The gap rule was
+    # removed: with the cosine-based score it only lowered recall at the same K.
     part_df.sort_values(["source1_entity_id", "blocking_score"], ascending=[True, False], inplace=True, ignore_index=True)
-    grp = part_df.groupby("source1_entity_id", sort=False)
-    rank = grp.cumcount() + 1
-    top1 = grp["blocking_score"].transform("max")
-    score_gap = top1 - part_df["blocking_score"]
-    keep = (rank <= S.MAX_CANDIDATES_PER_S1) & ((rank <= 5) | (score_gap <= 0.1))
-    return part_df[keep].reset_index(drop=True)
+    rank = part_df.groupby("source1_entity_id", sort=False).cumcount() + 1
+    return part_df[rank <= S.MAX_CANDIDATES_PER_S1].reset_index(drop=True)
 
 
 def generate_candidates(s1: pd.DataFrame, gallery: pd.DataFrame, ground_truth: dict[str, set[str]] | None = None) -> pd.DataFrame:
@@ -375,13 +372,13 @@ def run_recall_diagnostic(candidates_df: pd.DataFrame, ground_truth: dict[str, s
         print("Diagnostic: Ground truth contains 0 true matches for this split.")
         return
 
-    cand_pairs_set = set(zip(candidates_df["source1_entity_id"], candidates_df["candidate_entity_id"]))
-    recalled_matches = 0
-    for s1_id, matches in ground_truth.items():
-        if s1_id in s1_entities:
-            for m in matches:
-                if (s1_id, m) in cand_pairs_set:
-                    recalled_matches += 1
+    # Vectorised (a Python set of all candidate pairs does not fit in RAM at full scale)
+    truth_df = pd.DataFrame(
+        [(s, m) for s, ms in ground_truth.items() if s in s1_entities for m in ms],
+        columns=["source1_entity_id", "candidate_entity_id"],
+    )
+    hit_df = truth_df.merge(candidates_df[["source1_entity_id", "candidate_entity_id"]], how="inner")
+    recalled_matches = len(hit_df)
 
     overall_recall = recalled_matches / total_truth_pairs
     avg_cands = len(candidates_df) / max(1, len(s1_entities))
@@ -402,7 +399,7 @@ def run_recall_diagnostic(candidates_df: pd.DataFrame, ground_truth: dict[str, s
         c_s1 = set(s1_df[s1_df["country"] == country]["entity_id"])
         c_truth = sum(len(ground_truth.get(s, set())) for s in c_s1)
         c_pairs = candidates_df[candidates_df["country"] == country]
-        c_recalled = sum(1 for s, m in zip(c_pairs["source1_entity_id"], c_pairs["candidate_entity_id"]) if m in ground_truth.get(s, set()))
+        c_recalled = len(hit_df[hit_df["source1_entity_id"].isin(c_s1)])
         c_recall = (c_recalled / c_truth) if c_truth > 0 else 1.0
         c_avg = len(c_pairs) / max(1, len(c_s1))
         print(f"  {country:10s} | Truth: {c_truth:6,d} | Recalled: {c_recalled:6,d} | Recall: {c_recall:6.2%} | Avg Cands: {c_avg:5.2f}")
