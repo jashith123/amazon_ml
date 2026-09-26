@@ -1,50 +1,154 @@
-"""Stage 1-2 (Person A): raw TSV -> Contract 1 normalized parquet.
-
-Contract: see src/common/schema.py (NORMALIZED_COLS) and team_task_split.md.
-
-CLI:
-  python src/normalization.py --input dataset/train/train_source1.tsv \
-      --output data/normalized/source1_normalized.parquet
-
-A complete working reference implementation (multi-representation normalisation with
-Indic transliteration, legal-suffix extraction, address abbreviation expansion, house
-number / PIN extraction) lives in src/reference/normalization_ref.py. You may build on it
-or write your own; only the output schema is fixed.
-"""
-from __future__ import annotations
-
 import argparse
-import sys
-from pathlib import Path
-
 import pandas as pd
+import numpy as np
+import re
+import unicodedata
+from indic_transliteration import sanscript
+from indic_transliteration.detect import detect
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import schema as S  # noqa: E402
+import sys
+import os
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.common.schema import NORMALIZED_COLUMNS
+
+LEGAL_SUFFIXES = [
+    'pvt ltd', 'private limited', 'pvt limited', 'private ltd',
+    'ltd', 'limited', 'corp', 'corporation', 'inc', 'incorporated',
+    'llc', 'gmbh', 'sarl', 'co', 'company', 'plc'
+]
+
+LEGAL_SUFFIXES_SORTED = sorted(LEGAL_SUFFIXES, key=len, reverse=True)
+LEGAL_SUFFIX_REGEX = re.compile(r'\b(' + '|'.join(LEGAL_SUFFIXES_SORTED) + r')\b$')
+
+ABBREVIATIONS = {
+    r'\brd\b': 'road',
+    r'\bst\b': 'street',
+    r'\bblvd\b': 'boulevard',
+    r'\bave\b': 'avenue',
+    r'\bdr\b': 'drive',
+    r'\bln\b': 'lane',
+    r'\bpl\b': 'place',
+    r'\bct\b': 'court',
+    r'\bpt\b': 'point'
+}
+
+FRENCH_LIGATURES = {
+    'œ': 'oe', 'æ': 'ae', 'ß': 'ss', 'ô': 'o', 'ñ': 'n', 
+    'é': 'e', 'è': 'e', 'ê': 'e', 'ç': 'c', 'à': 'a', 'â': 'a'
+}
+
+def remove_punctuation(text):
+    if pd.isna(text): return ''
+    return re.sub(r'[^\w\s]', ' ', text)
+
+def collapse_whitespace(text):
+    if pd.isna(text): return ''
+    return re.sub(r'\s+', ' ', text).strip()
+
+def extract_legal_suffix(name):
+    if not name:
+        return name, ''
+    match = LEGAL_SUFFIX_REGEX.search(name)
+    if match:
+        suffix = match.group(1)
+        core = name[:match.start()].strip()
+        return core, suffix
+    return name, ''
+
+def get_tokens(text):
+    if not text: return ''
+    tokens = set(text.split())
+    return '|'.join(sorted(list(tokens)))
+
+def transliterate_and_fold(text):
+    if not text: return ''
+    
+    if is_non_latin(text):
+        scheme = detect(text)
+        if scheme:
+            # Prevent detecting ascii as ITRANS if it somehow still happens, though is_non_latin prevents this
+            text = sanscript.transliterate(text, scheme, sanscript.ITRANS).lower()
+            
+    for k, v in FRENCH_LIGATURES.items():
+        text = text.replace(k, v)
+        
+    return text
+
+def extract_numbers(text):
+    if not text: return ''
+    tokens = text.split()
+    nums = [t for t in tokens if re.search(r'\d', t)]
+    return '|'.join(nums)
+
+def extract_pin(text):
+    if not text: return ''
+    matches = re.findall(r'\b\d{5,6}\b', text)
+    if matches:
+        return matches[-1]
+    return ''
+
+def is_non_latin(text):
+    if not text: return False
+    try:
+        text.encode('ascii')
+        return False
+    except UnicodeEncodeError:
+        return True
 
 def normalize_source(df: pd.DataFrame) -> pd.DataFrame:
-    """Raw frame (entity_id, business_name, business_address, country) -> Contract 1 frame.
+    out = pd.DataFrame()
+    out['entity_id'] = df['entity_id'].astype(str)
+    out['country'] = df['country'].astype(str)
+    out['name_raw'] = df['business_name'].fillna('').astype(str)
+    out['address_raw'] = df['business_address'].fillna('').astype(str)
+    
+    def norm_text(t):
+        if not t: return ''
+        t = unicodedata.normalize('NFKD', t)
+        t = t.lower()
+        t = remove_punctuation(t)
+        t = collapse_whitespace(t)
+        return t
+        
+    out['name_norm'] = out['name_raw'].apply(norm_text)
+    
+    cores = []
+    suffixes = []
+    for n in out['name_norm']:
+        c, s = extract_legal_suffix(n)
+        cores.append(c)
+        suffixes.append(s)
+        
+    out['name_core'] = cores
+    out['legal_suffix'] = suffixes
+    out['name_tokens'] = out['name_core'].apply(get_tokens)
+    
+    out['is_non_latin'] = out['name_raw'].apply(is_non_latin)
+    out['name_transliterated'] = out['name_norm'].apply(transliterate_and_fold)
+    
+    def norm_addr(t):
+        if not t: return ''
+        t = unicodedata.normalize('NFKD', t).lower()
+        t = remove_punctuation(t)
+        t = collapse_whitespace(t)
+        for patt, repl in ABBREVIATIONS.items():
+            t = re.sub(patt, repl, t)
+        return t
+        
+    out['address_norm'] = out['address_raw'].apply(norm_addr)
+    out['address_numbers'] = out['address_norm'].apply(extract_numbers)
+    out['address_pin'] = out['address_norm'].apply(extract_pin)
+    
+    out = out[NORMALIZED_COLUMNS]
+    return out
 
-    TODO (Person A): implement. Must return exactly S.NORMALIZED_COLS in that order,
-    same row count as the input, no dropped entity_ids.
-    """
-    raise NotImplementedError("Person A: implement normalize_source (see docstring / reference)")
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Stage 1-2: normalisation")
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    args = ap.parse_args(argv)
-    df = pd.read_csv(args.input, sep="\t", dtype=str, keep_default_na=False)
-    out = normalize_source(df)
-    assert list(out.columns) == S.NORMALIZED_COLS, "Contract 1 column mismatch"
-    assert len(out) == len(df), "row count changed"
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(args.output, index=False)
-    print(f"wrote {args.output}: {len(out):,} rows")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', required=True, help='Input TSV file')
+    parser.add_argument('--output', required=True, help='Output Parquet file')
+    args = parser.parse_args()
+    
+    df = pd.read_csv(args.input, sep='\t', dtype=str)
+    df_norm = normalize_source(df)
+    df_norm.to_parquet(args.output, index=False)
