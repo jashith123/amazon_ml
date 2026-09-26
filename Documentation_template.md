@@ -63,10 +63,10 @@ All legs run inside one country partition; the gallery index (Source 2 ∪ Sourc
   - Exact keys with bucket caps: name core, name core + first house number, sorted token signature, acronym, full normalised address (≥12 chars), house number + first two address words, PIN/ZIP, Soundex and Metaphone of the first name token.
   - An absolute document-frequency cap (10,000 records) on TF-IDF terms: a fractional cap makes the cost quadratic in gallery size; with the absolute cap the full training set blocks in about 75 minutes on a laptop.
 - **Union scoring and pruning:** every union pair gets a heuristic score (word cosine + char cosine + a bonus per key leg + bidirectional bonus). The top 80 by heuristic are re-scored by a LightGBM pruner on 19 cheap features (the two cosines, leg flags, name and address token-set ratios, name ratio, house-number agreement/conflict, token counts, and a chunk-local gallery-side competition ratio: this pair's score relative to the best Source 1 for the same candidate). The top 30 by pruner probability form the candidate set.
-- **Candidate pairs generated:** 30 per Source 1 entity, 66.2M pairs for the training set, [TEST PAIRS] for the test set.
+- **Candidate pairs generated:** 30 per Source 1 entity, 66.2M pairs for the training set, 52.0M for the test set.
 - **How we ensured true matches were not lost:** the recall diagnostic on the full training set, and a dense-slice harness (`scripts/diagnose_blocking.py`) that keeps every record of one city so an entity faces its real neighbours. Findings: on Delhi, 3.4% of true pairs were never retrieved by any leg (heavily transliterated names with truncated addresses), 5.4% were retrieved but ranked 31-300 by the heuristic, union recall@100 was 96.5%. The learned pruner recovers most of the second group: on a held-out Bangalore slice recall@30 rose from 93.2% to 96.3% against a union ceiling of 96.4%.
 
-Full training-set blocking recall: heuristic top-30 88.9% (India 83.0%, US 92.9%); with the pruner [PRUNER RECALL]. Note that the Windows laptop used for the full run (16 cores, 23.6 GB RAM) forced two engineering choices that cost recall: the absolute df cap (about 0.6 points on a 50k-entity sample) and the 30-candidate cut.
+Full training-set blocking recall at 30 candidates per entity: heuristic score 88.9% (India 83.0%, US 92.9%); with the learned pruner **94.4% (India 91.8%, US 96.0%)**. Note that the Windows laptop used for the full run (16 cores, 23.6 GB RAM) forced two engineering choices that cost recall: the absolute df cap (about 0.6 points on a 50k-entity sample) and the 30-candidate cut.
 
 ---
 
@@ -95,10 +95,10 @@ Records are vectorised once per country (char TF-IDF, binary token sets, numeric
 | Run | All | US only | India only |
 |---|---|---|---|
 | Baseline (heuristic top-30) | 0.920 | 0.944 | 0.885 |
-| With learned pruner | [IMPROVED] | [IMPROVED US] | [IMPROVED IN] |
+| With learned pruner (submitted) | **0.940** | **0.951** | **0.924** |
 | Best global threshold, for comparison | 0.672 | 0.682 | 0.656 |
 
-Phase-2 validation AUC 0.9995. Public leaderboard: [LB SCORE].
+Phase-2 validation AUC 0.9995 (baseline) / 0.9993 (pruner run). Public leaderboard: [LB SCORE].
 
 - **Common false positives (wrong merges):** neighbouring businesses at the same address (same building, different tenants) with generic names; chains and franchises sharing a name with different branch addresses; the model relies on the house-number conflict and the competition features to separate these.
 - **Common false negatives (missed matches):** dominated by blocking recall (the ceiling): transliteration spellings that no character n-gram survives ("sauth phuds praivet limited"), combined with truncated addresses; names that are aliases or domain forms with a different address representation. India recall is 10 points below US for this reason.
