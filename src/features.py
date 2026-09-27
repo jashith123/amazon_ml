@@ -230,6 +230,17 @@ def build_features(pairs: pd.DataFrame, s1: pd.DataFrame | None = None, gallery:
     f["comp__rank"] = grp.rank(ascending=False, method="first").to_numpy(np.float32)
     f["comp__score_percentile"] = grp.rank(pct=True).to_numpy(np.float32)
     f["comp__score_gap_top1"] = (grp.transform("max") - pairs["blocking_score"]).to_numpy(np.float32)
+    # gallery-side competition (global, computed over the whole candidate file before chunking):
+    # one S2/S3 record belongs to at most one S1, so "is this S1 the best-scoring S1 for this
+    # candidate" is a direct false-positive detector. Ratio and rank only: density-safe.
+    if "g_max_score" in pairs.columns:
+        gmax = pairs["g_max_score"].to_numpy(np.float32)
+        bs = pairs["blocking_score"].to_numpy(np.float32)
+        f["comp__g_best_ratio"] = np.where(gmax > 0, bs / np.maximum(gmax, 1e-6), 1.0).astype(np.float32)
+        f["comp__g_rank"] = pairs["g_rank"].to_numpy(np.float32)
+    else:
+        f["comp__g_best_ratio"] = np.ones(len(pairs), dtype=np.float32)
+        f["comp__g_rank"] = np.ones(len(pairs), dtype=np.float32)
 
     for c in ("sem__embedding_cosine", "sem__embedding_rank", "sem__embedding_percentile", "sem__embedding_gap"):
         f[c] = np.zeros(len(pairs), dtype=np.float32)
@@ -300,6 +311,11 @@ def run(split: str, normalized_dir: Path, out_path: Path, max_s1: int | None = N
     from common.tokenmap import apply_to_gallery  # same learned normalisation as blocking
     gal = apply_to_gallery(gal)
     pairs = pd.read_parquet(cand_path or (S.CANDIDATES_TRAIN if split == "train" else S.CANDIDATES_TEST))
+    # gallery-side competition over the FULL candidate file (before any train sampling)
+    gcol = pairs["candidate_entity_id"]
+    pairs["g_max_score"] = pairs.groupby(gcol, sort=False)["blocking_score"].transform("max").astype(np.float32)
+    pairs["g_rank"] = pairs.groupby(gcol, sort=False)["blocking_score"].rank(ascending=False, method="min").astype(np.float32)
+    print(f"gallery-side competition computed over {len(pairs):,} pairs", flush=True)
     if split == "train":
         pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
         pairs[S.LABEL_COL] = pairs[S.LABEL_COL].astype(int)

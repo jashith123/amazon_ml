@@ -233,6 +233,12 @@ def _max_df(n_gal: int, frac: float):
 # union (top UNION_K by heuristic) into the final top-K. Active when the model file exists.
 UNION_K = int(os.environ.get("BLOCK_UNION_K", "80"))
 RETURN_PRUNER_FEATURES = os.environ.get("BLOCK_RETURN_PRUNER_FEATURES") == "1"
+# Sibling expansion: gallery records sharing the numeric address key of a confident candidate
+# (pruner prob >= SIB_SEED_P) are added as candidates. Matches of one S1 usually share an
+# address; this recovers name-garbled records that no name/address leg retrieves on its own.
+SIBLING = os.environ.get("BLOCK_SIBLING", "1") == "1"
+SIB_SEED_P = float(os.environ.get("BLOCK_SIB_SEED_P", "0.5"))
+SIB_CAP = int(os.environ.get("BLOCK_SIB_CAP", "100"))
 PRUNER_PATH = Path(os.environ.get("BLOCK_PRUNER", str(S.MODELS_DIR / "pruner.txt")))
 PRUNER_FEATURES = ["word_cos", "char_cos", "n_key_legs", "f_exact", "f_addr", "f_pin", "f_bidir", "f_word", "f_char",
                    "name_tsr", "addr_tsr", "name_ratio", "house_eq", "house_conflict", "name_ntok_s1", "name_ntok_g",
@@ -333,6 +339,15 @@ class _PartitionIndex:
         self.gal_addr_ntok = gal_part["address_norm"].fillna("").astype(str).str.count(" ").to_numpy(np.float32) + 1
         self.n_gal = n_gal
         self.threads = threads
+        # sibling key: sorted set of numeric address tokens (digits only), hashed; 0 = no key
+        nums = gal_part["address_numbers"].fillna("").astype(str)
+        sibkey = nums.map(lambda x: "|".join(sorted({t for t in x.split("|") if t.isdigit()})) if x else "")
+        h = _hash_keys(sibkey).copy(); h[sibkey.to_numpy() == ""] = 0
+        self.gal_sibkey = h
+        t = pd.DataFrame({"key": h, "g": np.arange(n_gal, dtype=np.int32)})
+        t = t[t["key"] != 0]
+        sizes = t.groupby("key")["g"].transform("size")
+        self.sib_table = t[sizes <= SIB_CAP].sort_values("key").reset_index(drop=True)
 
     def transform(self, s1_part: pd.DataFrame):
         word_doc = (s1_part["name_norm"].fillna("").astype(str) + " " + s1_part["address_norm"].fillna("").astype(str)).str.strip()
@@ -420,6 +435,27 @@ def _query_chunk(P: _PartitionIndex, s1_chunk: pd.DataFrame, offset: int, Q_word
         if pruner is not None:
             X = np.column_stack([feats[c] for c in PRUNER_FEATURES]).astype(np.float32)
             blocking_score = pruner.predict(X).astype(np.float64)
+            if SIBLING and len(P.sib_table):
+                seed = blocking_score >= SIB_SEED_P
+                sk = P.gal_sibkey[g_u[seed]]
+                q = pd.DataFrame({"key": sk, "s1": s1_u[seed]})
+                q = q[q["key"] != 0].drop_duplicates()
+                m = q.merge(P.sib_table, on="key", how="inner")
+                if len(m):
+                    cand = (m["s1"].to_numpy(np.int64) * n_gal + m["g"].to_numpy(np.int64))
+                    have = s1_u.astype(np.int64) * n_gal + g_u.astype(np.int64)
+                    cand = np.unique(cand[~np.isin(cand, have)])
+                    if len(cand):
+                        s1_n = (cand // n_gal).astype(np.int32); g_n = (cand % n_gal).astype(np.int32)
+                        legs_n = np.full(len(cand), LEG_ADDRESS, dtype=np.int32)
+                        wc_n = rowwise_dot(Q_word, P.G_word, s1_n, g_n)
+                        cc_n = rowwise_dot(Q_char, P.G_char, s1_n, g_n)
+                        feats_n = _pair_cheap_features(P, s1_chunk, s1_n, g_n, legs_n, wc_n, cc_n)
+                        Xn = np.column_stack([feats_n[c] for c in PRUNER_FEATURES]).astype(np.float32)
+                        sc_n = pruner.predict(Xn).astype(np.float64)
+                        s1_u = np.concatenate([s1_u, s1_n]); g_u = np.concatenate([g_u, g_n])
+                        legs_u = np.concatenate([legs_u, legs_n]); blocking_score = np.concatenate([blocking_score, sc_n])
+                        feats = {c: np.concatenate([feats[c], feats_n[c]]) for c in feats}
     # Final top-K cut per S1 BEFORE materialising string ids (keeps memory flat at full scale)
     keep = _topk(blocking_score, S.MAX_CANDIDATES_PER_S1)
     s1_u, g_u, legs_u, blocking_score = s1_u[keep], g_u[keep], legs_u[keep], blocking_score[keep]
