@@ -96,9 +96,11 @@ Records are vectorised once per country (char TF-IDF, binary token sets, numeric
 |---|---|---|---|
 | Baseline (heuristic top-30) | 0.920 | 0.944 | 0.885 |
 | With learned pruner (submitted) | **0.940** | **0.951** | **0.924** |
+| + learned token map (gallery→S1 token normalisation) | 0.940 | 0.950 | 0.926 |
+| + sibling expansion + gallery-side competition features (final run, see B) | 0.947 | 0.955 | 0.935 |
 | Best global threshold, for comparison | 0.672 | 0.682 | 0.656 |
 
-Phase-2 validation AUC 0.9995 (baseline) / 0.9993 (pruner run). Public leaderboard: [LB SCORE].
+Phase-2 validation AUC 0.9995 (baseline) / 0.9993 (pruner run). **Public leaderboard: 0.933** for the submitted (pruner-run) file; a probability prior-shift variant scored the same 0.933, i.e. the decision rule is not the bottleneck.
 
 - **Common false positives (wrong merges):** neighbouring businesses at the same address (same building, different tenants) with generic names; chains and franchises sharing a name with different branch addresses; the model relies on the house-number conflict and the competition features to separate these.
 - **Common false negatives (missed matches):** dominated by blocking recall (the ceiling): transliteration spellings that no character n-gram survives ("sauth phuds praivet limited"), combined with truncated addresses; names that are aliases or domain forms with a different address representation. India recall is 10 points below US for this reason.
@@ -131,5 +133,7 @@ A carefully engineered lexical blocker with a learned pruner, a compact LightGBM
 Reproduce: `pip install -r requirements.txt`, unzip the data into `dataset/`, then `python src/run_pipeline.py --stages all` (or the per-stage commands in the README). `output/matching_results.tsv` and `output/candidate_pairs.tsv` are written by the decision stage and pass `utils/validate_submission.py`.
 
 ### B. Additional Results
+
+Later experiments on the same pipeline (not all could be packaged before the deadline): a learned token map (12,994 gallery→Source-1 token mappings learned by Jaro-Winkler alignment of matched training pairs: praivet→private, lojistiks→logistics, 5outh→south) raised dense-slice recall by 1.5 points but full-data recall only 0.05; a sibling expansion leg (gallery records sharing the numeric address key of a candidate with pruner probability ≥ 0.5) raised full-data blocking recall to 94.9% (India 93.1%); two gallery-side competition features for the matcher (this pair's blocking score relative to the best Source-1 for the same candidate, and its rank) raised validation macro-F0.5 to 0.947. Validation decomposition of the submitted model: macro precision 0.968, macro recall 0.882, candidate recall 0.947; entities whose true matches are all in the candidate set score 0.9615, so both blocking recall and matcher precision limit the score. A zero-shot multilingual-e5-small embedding leg was measured and rejected (retrieval recall@40 70.5%, recovers 11% of never-retrieved pairs; cosine-alone AUC 0.87 on candidate pairs).
 
 Blocking recall at fixed K on a 50,000-entity sample at the full data's distractor density, before the pruner: K=30 97.9%, K=40 98.3%, K=50 98.6% (uncapped TF-IDF terms: 98.5% at K=30). Dense Delhi slice (122k S1, 545k gallery): recall@30 91.2%, @50 94.2%, @100 96.5%; never retrieved 3.4%.

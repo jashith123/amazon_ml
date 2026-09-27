@@ -308,13 +308,19 @@ def run(split: str, normalized_dir: Path, out_path: Path, max_s1: int | None = N
     t0 = time.time()
     suffix = "" if split == "train" else "_test"
     s1, gal = _load(normalized_dir, suffix)
+    need = ["entity_id", "country", "name_raw", "name_norm", "name_core", "legal_suffix", "address_raw", "address_norm",
+            "address_numbers", "address_pin"]
+    s1 = s1[[c for c in need if c in s1.columns]]
+    gal = gal[[c for c in need if c in gal.columns]]
     from common.tokenmap import apply_to_gallery  # same learned normalisation as blocking
     gal = apply_to_gallery(gal)
     pairs = pd.read_parquet(cand_path or (S.CANDIDATES_TRAIN if split == "train" else S.CANDIDATES_TEST))
     # gallery-side competition over the FULL candidate file (before any train sampling)
-    gcol = pairs["candidate_entity_id"]
-    pairs["g_max_score"] = pairs.groupby(gcol, sort=False)["blocking_score"].transform("max").astype(np.float32)
-    pairs["g_rank"] = pairs.groupby(gcol, sort=False)["blocking_score"].rank(ascending=False, method="min").astype(np.float32)
+    gcodes, _ = pd.factorize(pairs["candidate_entity_id"], sort=False)   # int keys: far lighter than 52M strings
+    gb = pairs.groupby(gcodes, sort=False)["blocking_score"]
+    pairs["g_max_score"] = gb.transform("max").astype(np.float32)
+    pairs["g_rank"] = gb.rank(ascending=False, method="min").astype(np.float32)
+    del gb, gcodes
     print(f"gallery-side competition computed over {len(pairs):,} pairs", flush=True)
     if split == "train":
         pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
