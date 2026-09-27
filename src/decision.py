@@ -228,38 +228,60 @@ def main(argv=None):
     ap.add_argument("--no-vetoes", action="store_true")
     ap.add_argument("--no-exclusivity", action="store_true")
     ap.add_argument("--out-dir", default=str(S.OUTPUT_DIR))
+    ap.add_argument("--save-probs", default=None, help="write scored pairs (ids + prob) to this parquet")
+    ap.add_argument("--load-probs", default=None, help="skip scoring; read scored pairs from this parquet")
+    ap.add_argument("--prior-shift", type=float, default=1.0,
+                    help="odds multiplier applied to calibrated probabilities before selection "
+                         "(<1 = test pool denser than training; e.g. 0.53 for 40%% vs 26%% distractors)")
+    ap.add_argument("--skip-candidates", action="store_true", help="do not rewrite candidate_pairs.tsv")
     args = ap.parse_args(argv)
 
     s1_ids = pd.read_csv(args.source1, sep="\t", dtype=str, keep_default_na=False, usecols=["entity_id"])["entity_id"].tolist()
 
-    model_path = Path(args.model)
-    if not model_path.exists() and S.MODEL_PHASE1.exists():
-        print(f"{model_path} not found, falling back to {S.MODEL_PHASE1}")
-        model_path = S.MODEL_PHASE1
+    if args.load_probs:
+        pairs = pd.read_parquet(args.load_probs)
+        print(f"loaded {len(pairs):,} scored pairs from {args.load_probs}")
+    else:
+        model_path = Path(args.model)
+        if not model_path.exists() and S.MODEL_PHASE1.exists():
+            print(f"{model_path} not found, falling back to {S.MODEL_PHASE1}")
+            model_path = S.MODEL_PHASE1
+        # Stream the (possibly 50M-row) test feature matrix in batches; keep only ids + prob.
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(args.features)
+        parts = []
+        n_rows = 0
+        for batch in pf.iter_batches(batch_size=1_000_000):
+            feats = batch.to_pandas()
+            probs = predict_probs(feats, model_path, Path(args.calibrator), vetoes=not args.no_vetoes)
+            parts.append(pd.DataFrame({
+                "source1_entity_id": feats["source1_entity_id"].astype("string[pyarrow]"),
+                "candidate_entity_id": feats["candidate_entity_id"].astype("string[pyarrow]"),
+                "prob": probs.astype(np.float32),
+            }))
+            n_rows += len(feats)
+            print(f"  scored {n_rows:,} pairs", flush=True)
+        pairs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "prob"])
+        del parts
+        if args.save_probs:
+            Path(args.save_probs).parent.mkdir(parents=True, exist_ok=True)
+            pairs.to_parquet(args.save_probs, index=False)
+            print(f"saved scored pairs to {args.save_probs}")
 
-    # Stream the (possibly 50M-row) test feature matrix in batches; keep only ids + prob.
-    import pyarrow.parquet as pq
-    pf = pq.ParquetFile(args.features)
-    parts = []
-    n_rows = 0
-    for batch in pf.iter_batches(batch_size=1_000_000):
-        feats = batch.to_pandas()
-        probs = predict_probs(feats, model_path, Path(args.calibrator), vetoes=not args.no_vetoes)
-        parts.append(pd.DataFrame({
-            "source1_entity_id": feats["source1_entity_id"].astype("string[pyarrow]"),
-            "candidate_entity_id": feats["candidate_entity_id"].astype("string[pyarrow]"),
-            "prob": probs.astype(np.float32),
-        }))
-        n_rows += len(feats)
-        print(f"  scored {n_rows:,} pairs", flush=True)
-    pairs = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "prob"])
-    del parts
+    if args.prior_shift != 1.0:
+        # Bayesian prior shift: odds' = alpha * odds. Corrects for a test pool with a different
+        # matched/distractor ratio than the calibration data.
+        p = pairs["prob"].to_numpy(np.float64)
+        a = args.prior_shift
+        pairs["prob"] = (a * p / (a * p + (1.0 - p))).astype(np.float32)
+        print(f"prior shift alpha={a}: mean prob {p.mean():.4f} -> {pairs['prob'].mean():.4f}")
     pred = decide(pairs, formula=args.formula, exclusivity=not args.no_exclusivity, min_prob=args.min_prob)
 
     out_dir = Path(args.out_dir)
     write_matching_results(pred, s1_ids, out_dir / "matching_results.tsv")
     # candidate_pairs.tsv = exactly the pairs the model scored (the feature matrix rows)
-    write_candidate_pairs(pairs[["source1_entity_id", "candidate_entity_id"]], s1_ids, out_dir / "candidate_pairs.tsv")
+    if not args.skip_candidates:
+        write_candidate_pairs(pairs[["source1_entity_id", "candidate_entity_id"]], s1_ids, out_dir / "candidate_pairs.tsv")
     n_match = sum(len(v) for v in pred.values())
     n_single = sum(1 for s in s1_ids if not pred.get(s))
     print(f"wrote {out_dir/'matching_results.tsv'}: {len(s1_ids):,} entities, {n_match:,} matches, "
