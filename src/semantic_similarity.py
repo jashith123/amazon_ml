@@ -64,7 +64,7 @@ def main():
     df_out = pd.DataFrame({
         'source1_entity_id': df_pairs['source1_entity_id'],
         'candidate_entity_id': df_pairs['candidate_entity_id'],
-        'sem__embedding_cosine': similarities
+        'sem__embedding_cosine': np.array(similarities, dtype=np.float32)
     })
 
     print(f"Saving to {args.output}...")
