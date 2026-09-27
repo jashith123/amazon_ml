@@ -578,6 +578,8 @@ def main(argv=None):
         if p.exists():
             gal_dfs.append(pd.read_parquet(p, columns=BLOCKING_COLS))
     gal = pd.concat(gal_dfs, ignore_index=True) if gal_dfs else pd.DataFrame(columns=S.NORMALIZED_COLS)
+    from common.tokenmap import apply_to_gallery  # learned gallery->S1 token normalisation
+    gal = apply_to_gallery(gal)
 
     gt = None
     if args.split == "train":

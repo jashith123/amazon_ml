@@ -297,6 +297,8 @@ def run(split: str, normalized_dir: Path, out_path: Path, max_s1: int | None = N
     t0 = time.time()
     suffix = "" if split == "train" else "_test"
     s1, gal = _load(normalized_dir, suffix)
+    from common.tokenmap import apply_to_gallery  # same learned normalisation as blocking
+    gal = apply_to_gallery(gal)
     pairs = pd.read_parquet(cand_path or (S.CANDIDATES_TRAIN if split == "train" else S.CANDIDATES_TEST))
     if split == "train":
         pairs = pairs.rename(columns={"is_true_match": S.LABEL_COL})
